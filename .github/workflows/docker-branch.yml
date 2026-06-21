@@ -3,7 +3,7 @@ name: Docker Branch Images
 on:
   push:
     branches:
-      - main
+      - mine
       - debug
   workflow_dispatch:
 
