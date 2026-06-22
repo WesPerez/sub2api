@@ -3,7 +3,6 @@ package service
 import (
 	"testing"
 
-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,8 +47,8 @@ func TestResponsesProbeBodyHasFunctionCall(t *testing.T) {
 }
 
 func TestSelectResponsesProbeModel(t *testing.T) {
-	// No model_mapping -> fall back to DefaultTestModel (OpenAI official APIKey).
-	require.Equal(t, openai.DefaultTestModel, selectResponsesProbeModel(&Account{}))
+	// No model_mapping -> fall back to the Responses probe default.
+	require.Equal(t, openaiResponsesDefaultProbeModel, selectResponsesProbeModel(&Account{}))
 
 	// model_mapping values are upstream models; pick first by sort for reproducibility.
 	acct := &Account{Credentials: map[string]any{
@@ -70,9 +69,9 @@ func TestSelectResponsesProbeModel(t *testing.T) {
 	}}
 	require.Equal(t, "real-model", selectResponsesProbeModel(acctWild))
 
-	// Only wildcard mappings -> DefaultTestModel.
+	// Only wildcard mappings -> Responses probe default.
 	acctAllWild := &Account{Credentials: map[string]any{
 		"model_mapping": map[string]any{"a": "gpt-*"},
 	}}
-	require.Equal(t, openai.DefaultTestModel, selectResponsesProbeModel(acctAllWild))
+	require.Equal(t, openaiResponsesDefaultProbeModel, selectResponsesProbeModel(acctAllWild))
 }
