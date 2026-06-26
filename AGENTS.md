@@ -1,5 +1,9 @@
 # Sub2API Server Agent Rules
 
+Before making changes in this repository, agents must read this file and
+`BRANCH_DEPLOYMENT.md`. Do not start implementation, verification, deployment,
+or GitHub submission work until those project rules are understood.
+
 This repository is deployed on the server from GitHub-built container images.
 Do not install dependencies, run package managers, compile, or build Docker
 images on the server.
