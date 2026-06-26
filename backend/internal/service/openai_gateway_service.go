@@ -2540,7 +2540,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			markPatchSet("model", upstreamModel)
 		}
 	}
-	if strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()) == "minimal" {
+	if shouldForceOpenAIResponsesReasoningEffortXHigh(upstreamModel) {
+		markPatchSet("reasoning.effort", "xhigh")
+		if gjson.GetBytes(body, "reasoning_effort").Exists() {
+			markPatchSet("reasoning_effort", "xhigh")
+		}
+	} else if strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()) == "minimal" {
 		markPatchSet("reasoning.effort", "none")
 		logger.LegacyPrintf("service.openai_gateway", "[OpenAI] Normalized reasoning.effort: minimal -> none (account: %s)", account.Name)
 	}
@@ -3193,6 +3198,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		return nil, policyErr
 	}
 	body = updatedBody
+	if shouldForceOpenAIResponsesReasoningEffortXHigh(policyModel) {
+		var forceErr error
+		body, forceErr = forceOpenAIResponsesReasoningEffortXHigh(body)
+		if forceErr != nil {
+			return nil, forceErr
+		}
+		forcedReasoningEffort := "xhigh"
+		reasoningEffort = &forcedReasoningEffort
+	}
 
 	apiKey := getAPIKeyFromContext(c)
 	if IsImageGenerationIntent(openAIResponsesEndpoint, reqModel, body) && !GroupAllowsImageGeneration(apiKeyGroup(apiKey)) {
@@ -6739,6 +6753,31 @@ func extractOpenAIReasoningEffortFromBody(body []byte, requestedModel string) *s
 		return nil
 	}
 	return &value
+}
+
+func forceOpenAIResponsesReasoningEffortXHigh(body []byte) ([]byte, error) {
+	updated, err := sjson.SetBytes(body, "reasoning.effort", "xhigh")
+	if err != nil {
+		return body, fmt.Errorf("force reasoning.effort: %w", err)
+	}
+	if gjson.GetBytes(updated, "reasoning_effort").Exists() {
+		updated, err = sjson.SetBytes(updated, "reasoning_effort", "xhigh")
+		if err != nil {
+			return body, fmt.Errorf("force reasoning_effort: %w", err)
+		}
+	}
+	return updated, nil
+}
+
+func shouldForceOpenAIResponsesReasoningEffortXHigh(model string) bool {
+	modelID := strings.ToLower(strings.TrimSpace(model))
+	if modelID == "" {
+		return false
+	}
+	if parts := strings.Split(modelID, "/"); len(parts) > 1 {
+		modelID = parts[len(parts)-1]
+	}
+	return strings.HasPrefix(modelID, "gpt-") && !strings.HasPrefix(modelID, "gpt-image-")
 }
 
 func extractOpenAIServiceTier(reqBody map[string]any) *string {
