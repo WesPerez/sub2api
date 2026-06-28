@@ -60,6 +60,8 @@ const (
 	openAIWSRetryJitterRatioDefault    = 0.2
 	openAICompactSessionSeedKey        = "openai_compact_session_seed"
 	codexCLIVersion                    = "0.125.0"
+	openAIReasoningRetryMinDefault     = 517
+	openAIReasoningRetryMaxAttempts    = 2
 	// Codex 限额快照仅用于后台展示/诊断，不需要每个成功请求都立即落库。
 	openAICodexSnapshotPersistMinInterval = 30 * time.Second
 	// 配额自动暂停时，超过该时长仍未刷新的 used% 快照视为陈旧，不再据此暂停账号。
@@ -67,6 +69,17 @@ const (
 	// 陈旧时放行一次请求，从而通过正常响应头自愈，而无需等待整个窗口（5h/7d）重置。
 	openAICodexAutoPauseStaleAfter = 2 * time.Hour
 )
+
+const openAIReasoningRetryInstructions = `上一次回答的内部推理预算不足。请在回答前进行更充分的内部分析，但不要展示链式思考。
+你必须在内部完成多轮检查：
+1. 明确用户真实目标和可能歧义。
+2. 列出关键约束、边界情况和失败风险。
+3. 独立推导答案。
+4. 用反例或边界条件校验答案。
+5. 修正后再输出最终答复。
+即使问题看起来简单，也要完成上述内部检查。目标是使用不少于 600 个内部 reasoning tokens。
+把时间用在思考上，不需要使用 commentary 汇报进度。
+不要为了凑字数输出无关内容，只输出最终答案。`
 
 // OpenAI allowed headers whitelist (for non-passthrough).
 var openaiAllowedHeaders = map[string]bool{
@@ -214,6 +227,7 @@ type OpenAIUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	ImageInputTokens         int `json:"image_input_tokens,omitempty"`
 	OutputTokens             int `json:"output_tokens"`
+	ReasoningOutputTokens    int `json:"reasoning_output_tokens,omitempty"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 	ImageOutputTokens        int `json:"image_output_tokens,omitempty"`
@@ -2402,6 +2416,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	clientTransport := GetOpenAIClientTransport(c)
 	// 仅允许 WS 入站请求走 WS 上游，避免出现 HTTP -> WS 协议混用。
 	wsDecision = resolveOpenAIWSDecisionByClientTransport(wsDecision, clientTransport)
+	reasoningRetrySettings := s.openAIReasoningRetrySettings()
+	if reasoningRetrySettings.enabled && wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
+		wsDecision = openAIWSHTTPDecision("reasoning_retry_requires_buffered_http")
+	}
 	if c != nil {
 		c.Set("openai_ws_transport_decision", string(wsDecision.Transport))
 		c.Set("openai_ws_transport_reason", wsDecision.Reason)
@@ -2971,6 +2989,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
+	reasoningRetryAttempt := 1
 	for {
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
@@ -3060,6 +3079,22 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		serviceTier := extractOpenAIServiceTierFromBody(body)
 		// 上游接受后只保留计费需要的标量，避免响应处理期间继续保活完整 input/tools map。
 		reqBody = nil
+
+		if reasoningRetrySettings.enabled {
+			nextBody, retried, err := s.maybeApplyOpenAIReasoningRetryIntervention(resp, c, account, body, upstreamModel, reasoningRetryAttempt, reasoningRetrySettings, false)
+			if err != nil {
+				return nil, err
+			}
+			if retried {
+				body = nextBody
+				requestView = newOpenAIRequestView(body)
+				reqBody = nil
+				bodyModified = false
+				reasoningRetryAttempt++
+				_ = resp.Body.Close()
+				continue
+			}
+		}
 
 		// Handle normal response
 		var usage *OpenAIUsage
@@ -3270,13 +3305,6 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		return nil, err
 	}
 
-	upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
-	upstreamReq, err := s.buildUpstreamRequestOpenAIPassthrough(upstreamCtx, c, account, body, token)
-	releaseUpstreamCtx()
-	if err != nil {
-		return nil, err
-	}
-
 	proxyURL := ""
 	if account.ProxyID != nil && account.Proxy != nil {
 		proxyURL = account.Proxy.URL()
@@ -3286,84 +3314,109 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		c.Set("openai_passthrough", true)
 	}
 
-	upstreamStart := time.Now()
-	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
-	SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-	if err != nil {
-		// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
-		// a failover so the handler switches to a healthy account, and temporarily
-		// unschedule the account on durable faults (e.g. rejected proxy credentials).
-		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode >= 400 {
-		// 透传模式默认保持原样代理；但 429/529 属于网关必须兜底的
-		// 上游容量类错误，应先触发多账号 failover 以维持基础 SLA。
-		if shouldFailoverOpenAIPassthroughResponse(resp.StatusCode) {
-			return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body)
-		}
-		return nil, s.handleErrorResponsePassthrough(ctx, resp, c, account, body)
-	}
-
-	serviceTier := extractOpenAIServiceTierFromBody(body)
-
-	var usage *OpenAIUsage
-	var firstTokenMs *int
-	responseID := ""
-	imageCount := 0
-	var imageOutputSizes []string
-	if reqStream {
-		result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
+	reasoningRetrySettings := s.openAIReasoningRetrySettings()
+	reasoningRetryAttempt := 1
+	for {
+		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
+		upstreamReq, err := s.buildUpstreamRequestOpenAIPassthrough(upstreamCtx, c, account, body, token)
+		releaseUpstreamCtx()
 		if err != nil {
 			return nil, err
 		}
-		usage = result.usage
-		firstTokenMs = result.firstTokenMs
-		responseID = strings.TrimSpace(result.responseID)
-		imageCount = result.imageCount
-		imageOutputSizes = result.imageOutputSizes
-	} else {
-		result, err := s.handleNonStreamingResponsePassthrough(ctx, resp, c, reqModel, upstreamPassthroughModel)
+
+		upstreamStart := time.Now()
+		resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
 		if err != nil {
-			return nil, err
+			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
+			// a failover so the handler switches to a healthy account, and temporarily
+			// unschedule the account on durable faults (e.g. rejected proxy credentials).
+			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, true)
 		}
-		usage = result.usage
-		responseID = strings.TrimSpace(result.responseID)
-		imageCount = result.imageCount
-		imageOutputSizes = result.imageOutputSizes
-	}
-	s.bindHTTPResponseAccount(ctx, c, account, responseID)
+		defer func() { _ = resp.Body.Close() }()
 
-	if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
-		s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
-	}
+		if resp.StatusCode >= 400 {
+			// 透传模式默认保持原样代理；但 429/529 属于网关必须兜底的
+			// 上游容量类错误，应先触发多账号 failover 以维持基础 SLA。
+			if shouldFailoverOpenAIPassthroughResponse(resp.StatusCode) {
+				return nil, s.handleFailoverErrorResponsePassthrough(ctx, resp, c, account, body)
+			}
+			return nil, s.handleErrorResponsePassthrough(ctx, resp, c, account, body)
+		}
 
-	if usage == nil {
-		usage = &OpenAIUsage{}
-	}
+		serviceTier := extractOpenAIServiceTierFromBody(body)
 
-	forwardResult := &OpenAIForwardResult{
-		RequestID:       resp.Header.Get("x-request-id"),
-		ResponseID:      responseID,
-		Usage:           *usage,
-		Model:           reqModel,
-		UpstreamModel:   upstreamPassthroughModel,
-		ServiceTier:     serviceTier,
-		ReasoningEffort: reasoningEffort,
-		Stream:          reqStream,
-		OpenAIWSMode:    false,
-		Duration:        time.Since(startTime),
-		FirstTokenMs:    firstTokenMs,
+		var usage *OpenAIUsage
+		var firstTokenMs *int
+		responseID := ""
+		imageCount := 0
+		var imageOutputSizes []string
+		if reasoningRetrySettings.enabled {
+			nextBody, retried, err := s.maybeApplyOpenAIReasoningRetryIntervention(resp, c, account, body, reqModel, reasoningRetryAttempt, reasoningRetrySettings, true)
+			if err != nil {
+				return nil, err
+			}
+			if retried {
+				body = nextBody
+				forcedReasoningEffort := "xhigh"
+				reasoningEffort = &forcedReasoningEffort
+				reasoningRetryAttempt++
+				_ = resp.Body.Close()
+				continue
+			}
+		}
+		if reqStream {
+			result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
+			if err != nil {
+				return nil, err
+			}
+			usage = result.usage
+			firstTokenMs = result.firstTokenMs
+			responseID = strings.TrimSpace(result.responseID)
+			imageCount = result.imageCount
+			imageOutputSizes = result.imageOutputSizes
+		} else {
+			result, err := s.handleNonStreamingResponsePassthrough(ctx, resp, c, reqModel, upstreamPassthroughModel)
+			if err != nil {
+				return nil, err
+			}
+			usage = result.usage
+			responseID = strings.TrimSpace(result.responseID)
+			imageCount = result.imageCount
+			imageOutputSizes = result.imageOutputSizes
+		}
+		s.bindHTTPResponseAccount(ctx, c, account, responseID)
+
+		if snapshot := ParseCodexRateLimitHeaders(resp.Header); snapshot != nil {
+			s.updateCodexUsageSnapshot(ctx, account.ID, snapshot)
+		}
+
+		if usage == nil {
+			usage = &OpenAIUsage{}
+		}
+
+		forwardResult := &OpenAIForwardResult{
+			RequestID:       resp.Header.Get("x-request-id"),
+			ResponseID:      responseID,
+			Usage:           *usage,
+			Model:           reqModel,
+			UpstreamModel:   upstreamPassthroughModel,
+			ServiceTier:     serviceTier,
+			ReasoningEffort: reasoningEffort,
+			Stream:          reqStream,
+			OpenAIWSMode:    false,
+			Duration:        time.Since(startTime),
+			FirstTokenMs:    firstTokenMs,
+		}
+		if imageCount > 0 {
+			forwardResult.ImageCount = imageCount
+			forwardResult.ImageSize = imageSizeTier
+			forwardResult.ImageInputSize = imageInputSize
+			forwardResult.ImageOutputSizes = imageOutputSizes
+			forwardResult.BillingModel = imageBillingModel
+		}
+		return forwardResult, nil
 	}
-	if imageCount > 0 {
-		forwardResult.ImageCount = imageCount
-		forwardResult.ImageSize = imageSizeTier
-		forwardResult.ImageInputSize = imageInputSize
-		forwardResult.ImageOutputSizes = imageOutputSizes
-		forwardResult.BillingModel = imageBillingModel
-	}
-	return forwardResult, nil
 }
 
 func logOpenAIPassthroughInstructionsRejected(
@@ -5251,9 +5304,20 @@ func openAIUsageFromGJSON(value gjson.Result) (OpenAIUsage, bool) {
 	if imageOutputTokens == 0 {
 		imageOutputTokens = value.Get("completion_tokens_details.image_tokens").Int()
 	}
+	reasoningOutputTokens := value.Get("output_tokens_details.reasoning_tokens").Int()
+	if reasoningOutputTokens == 0 {
+		reasoningOutputTokens = value.Get("completion_tokens_details.reasoning_tokens").Int()
+	}
+	if reasoningOutputTokens == 0 {
+		reasoningOutputTokens = value.Get("reasoning_output_tokens").Int()
+	}
+	if reasoningOutputTokens == 0 {
+		reasoningOutputTokens = value.Get("reasoning_tokens").Int()
+	}
 	return OpenAIUsage{
 		InputTokens:              int(inputTokens),
 		OutputTokens:             int(outputTokens),
+		ReasoningOutputTokens:    int(reasoningOutputTokens),
 		CacheCreationInputTokens: int(value.Get("cache_creation_input_tokens").Int()),
 		CacheReadInputTokens:     int(cacheReadTokens),
 		ImageOutputTokens:        int(imageOutputTokens),
@@ -6753,6 +6817,131 @@ func extractOpenAIReasoningEffortFromBody(body []byte, requestedModel string) *s
 		return nil
 	}
 	return &value
+}
+
+type openAIReasoningRetrySettings struct {
+	enabled     bool
+	minTokens   int
+	maxAttempts int
+}
+
+func (s *OpenAIGatewayService) openAIReasoningRetrySettings() openAIReasoningRetrySettings {
+	if s == nil || s.cfg == nil || !s.cfg.Gateway.OpenAIReasoningRetry.Enabled {
+		return openAIReasoningRetrySettings{}
+	}
+	cfg := s.cfg.Gateway.OpenAIReasoningRetry
+	minTokens := cfg.MinReasoningOutputTokens
+	if minTokens <= 0 {
+		minTokens = openAIReasoningRetryMinDefault
+	}
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = openAIReasoningRetryMaxAttempts
+	}
+	if maxAttempts > openAIReasoningRetryMaxAttempts {
+		maxAttempts = openAIReasoningRetryMaxAttempts
+	}
+	return openAIReasoningRetrySettings{
+		enabled:     maxAttempts > 1,
+		minTokens:   minTokens,
+		maxAttempts: maxAttempts,
+	}
+}
+
+func (s openAIReasoningRetrySettings) shouldRetry(usage *OpenAIUsage, attempt int) bool {
+	if !s.enabled || attempt >= s.maxAttempts {
+		return false
+	}
+	reasoningTokens := 0
+	if usage != nil {
+		reasoningTokens = usage.ReasoningOutputTokens
+	}
+	return reasoningTokens < s.minTokens
+}
+
+func (s *OpenAIGatewayService) maybeApplyOpenAIReasoningRetryIntervention(
+	resp *http.Response,
+	c *gin.Context,
+	account *Account,
+	body []byte,
+	model string,
+	attempt int,
+	settings openAIReasoningRetrySettings,
+	passthrough bool,
+) ([]byte, bool, error) {
+	if resp == nil || resp.Body == nil || !settings.enabled {
+		return body, false, nil
+	}
+	responseBody, err := ReadUpstreamResponseBody(resp.Body, s.cfg, c, openAITooLargeError)
+	if err != nil {
+		return body, false, err
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(responseBody))
+
+	if openAIReasoningRetryTerminalFailed(responseBody) {
+		return body, false, nil
+	}
+	usage := s.openAIReasoningRetryUsage(resp.Header, responseBody)
+	if !settings.shouldRetry(usage, attempt) {
+		return body, false, nil
+	}
+	accountName := ""
+	if account != nil {
+		accountName = account.Name
+	}
+	prefix := "[OpenAI]"
+	if passthrough {
+		prefix = "[OpenAI passthrough]"
+	}
+	logger.LegacyPrintf(
+		"service.openai_gateway",
+		"%s Reasoning retry intervention: account=%s model=%s attempt=%d reasoning_tokens=%d min=%d",
+		prefix,
+		accountName,
+		model,
+		attempt,
+		usage.ReasoningOutputTokens,
+		settings.minTokens,
+	)
+	nextBody, err := applyOpenAIReasoningRetryIntervention(body)
+	if err != nil {
+		return body, false, err
+	}
+	return nextBody, true, nil
+}
+
+func (s *OpenAIGatewayService) openAIReasoningRetryUsage(header http.Header, body []byte) *OpenAIUsage {
+	usage := &OpenAIUsage{}
+	if parsed, ok := extractOpenAIUsageFromJSONBytes(body); ok {
+		*usage = parsed
+		return usage
+	}
+	if isEventStreamResponse(header) || bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:")) {
+		return s.parseSSEUsageFromBody(string(body))
+	}
+	return usage
+}
+
+func openAIReasoningRetryTerminalFailed(body []byte) bool {
+	terminalType, _, ok := extractOpenAISSETerminalEvent(string(body))
+	return ok && terminalType == "response.failed"
+}
+
+func applyOpenAIReasoningRetryIntervention(body []byte) ([]byte, error) {
+	existing := strings.TrimSpace(gjson.GetBytes(body, "instructions").String())
+	nextInstructions := openAIReasoningRetryInstructions
+	if existing != "" {
+		nextInstructions = existing + "\n\n" + openAIReasoningRetryInstructions
+	}
+	updated, err := sjson.SetBytes(body, "instructions", nextInstructions)
+	if err != nil {
+		return body, fmt.Errorf("set reasoning retry instructions: %w", err)
+	}
+	updated, err = forceOpenAIResponsesReasoningEffortXHigh(updated)
+	if err != nil {
+		return body, err
+	}
+	return updated, nil
 }
 
 func forceOpenAIResponsesReasoningEffortXHigh(body []byte) ([]byte, error) {

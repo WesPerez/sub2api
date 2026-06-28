@@ -124,6 +124,89 @@ type errReadCloser struct {
 func (r errReadCloser) Read([]byte) (int, error) { return 0, r.err }
 func (r errReadCloser) Close() error             { return nil }
 
+func openAIReasoningRetryJSONResponse(responseID, text string, reasoningTokens int) *http.Response {
+	body := fmt.Sprintf(
+		`{"id":%q,"model":"gpt-5.3-codex","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":10,"output_tokens":20,"output_tokens_details":{"reasoning_tokens":%d}}}`,
+		responseID,
+		text,
+		reasoningTokens,
+	)
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type": []string{"application/json"},
+			"x-request-id": []string{responseID + "_request"},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func TestOpenAIUsageExtractsReasoningTokens(t *testing.T) {
+	body := []byte(`{"response":{"usage":{"input_tokens":1,"output_tokens":2,"output_tokens_details":{"reasoning_tokens":516}}}}`)
+	usage, ok := extractOpenAIUsageFromJSONBytes(body)
+	require.True(t, ok)
+	require.Equal(t, 516, usage.ReasoningOutputTokens)
+
+	chatBody := []byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":600}}}`)
+	usage, ok = extractOpenAIUsageFromJSONBytes(chatBody)
+	require.True(t, ok)
+	require.Equal(t, 600, usage.ReasoningOutputTokens)
+}
+
+func TestApplyOpenAIReasoningRetryIntervention(t *testing.T) {
+	updated, err := applyOpenAIReasoningRetryIntervention([]byte(`{"model":"gpt-5.3-codex","instructions":"base instructions","reasoning":{"effort":"medium"}}`))
+	require.NoError(t, err)
+	require.Contains(t, gjson.GetBytes(updated, "instructions").String(), "base instructions")
+	require.Contains(t, gjson.GetBytes(updated, "instructions").String(), "不需要使用 commentary 汇报进度")
+	require.Equal(t, "xhigh", gjson.GetBytes(updated, "reasoning.effort").String())
+}
+
+func TestOpenAIGatewayServiceForwardReasoningRetryReturnsSecondEvenIfStillLow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.3-codex","stream":false,"instructions":"base","input":"hi"}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		openAIReasoningRetryJSONResponse("resp_first", "first answer", 516),
+		openAIReasoningRetryJSONResponse("resp_second", "second answer", 200),
+	}}
+	svc := &OpenAIGatewayService{
+		cfg: &config.Config{Gateway: config.GatewayConfig{
+			MaxLineSize: defaultMaxLineSize,
+			OpenAIReasoningRetry: config.GatewayOpenAIReasoningRetryConfig{
+				Enabled:                  true,
+				MinReasoningOutputTokens: 517,
+				MaxAttempts:              2,
+			},
+		}},
+		httpUpstream:  upstream,
+		toolCorrector: NewCodexToolCorrector(),
+	}
+	account := &Account{
+		ID:          1,
+		Name:        "openai",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "sk-test"},
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Len(t, upstream.bodies, 2)
+	require.Equal(t, "resp_second", result.ResponseID)
+	require.Equal(t, 200, result.Usage.ReasoningOutputTokens)
+	require.Contains(t, rec.Body.String(), "second answer")
+	require.NotContains(t, rec.Body.String(), "first answer")
+	require.NotContains(t, string(upstream.bodies[0]), "内部推理预算不足")
+	require.Contains(t, string(upstream.bodies[1]), "内部推理预算不足")
+	require.Contains(t, string(upstream.bodies[1]), "不需要使用 commentary 汇报进度")
+	require.Equal(t, "xhigh", gjson.GetBytes(upstream.bodies[1], "reasoning.effort").String())
+}
+
 type failingGinWriter struct {
 	gin.ResponseWriter
 	failAfter int

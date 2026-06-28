@@ -717,6 +717,9 @@ type GatewayConfig struct {
 	// OpenAIPassthroughAllowTimeoutHeaders: OpenAI 透传模式是否放行客户端超时头
 	// 关闭（默认）可避免 x-stainless-timeout 等头导致上游提前断流。
 	OpenAIPassthroughAllowTimeoutHeaders bool `mapstructure:"openai_passthrough_allow_timeout_headers"`
+	// OpenAIReasoningRetry: retry OpenAI Responses once with stronger
+	// reasoning instructions when the first response reports too few reasoning tokens.
+	OpenAIReasoningRetry GatewayOpenAIReasoningRetryConfig `mapstructure:"openai_reasoning_retry"`
 	// OpenAIWS: OpenAI Responses WebSocket 配置（默认开启，可按需回滚到 HTTP）
 	OpenAIWS GatewayOpenAIWSConfig `mapstructure:"openai_ws"`
 	// OpenAIScheduler: OpenAI 高级调度器粘性逃逸配置
@@ -799,6 +802,18 @@ type GatewayConfig struct {
 	// UserMessageQueue: 用户消息串行队列配置
 	// 对 role:"user" 的真实用户消息实施账号级串行化 + RPM 自适应延迟
 	UserMessageQueue UserMessageQueueConfig `mapstructure:"user_message_queue"`
+}
+
+// GatewayOpenAIReasoningRetryConfig controls the optional intervention retry
+// for Responses API reasoning token usage.
+type GatewayOpenAIReasoningRetryConfig struct {
+	// Enabled turns on the intervention retry for OpenAI Responses forwarding.
+	Enabled bool `mapstructure:"enabled"`
+	// MinReasoningOutputTokens is the minimum accepted reasoning token count.
+	// Use 517 to enforce "greater than 516".
+	MinReasoningOutputTokens int `mapstructure:"min_reasoning_output_tokens"`
+	// MaxAttempts is capped at 2: original request plus one intervention retry.
+	MaxAttempts int `mapstructure:"max_attempts"`
 }
 
 // GatewayOpenAIHTTP2Config OpenAI HTTP 上游协议配置。
@@ -1829,6 +1844,9 @@ func setDefaults() {
 	viper.SetDefault("gateway.force_codex_cli", false)
 	viper.SetDefault("gateway.codex_image_generation_bridge_enabled", false)
 	viper.SetDefault("gateway.openai_passthrough_allow_timeout_headers", false)
+	viper.SetDefault("gateway.openai_reasoning_retry.enabled", false)
+	viper.SetDefault("gateway.openai_reasoning_retry.min_reasoning_output_tokens", 517)
+	viper.SetDefault("gateway.openai_reasoning_retry.max_attempts", 2)
 	// OpenAI Responses WebSocket（默认开启；可通过 force_http 紧急回滚）
 	viper.SetDefault("gateway.openai_ws.enabled", true)
 	viper.SetDefault("gateway.openai_ws.mode_router_v2_enabled", false)
@@ -2458,6 +2476,15 @@ func (c *Config) Validate() error {
 	}
 	if c.Gateway.OpenAIResponseHeaderTimeout < 0 {
 		return fmt.Errorf("gateway.openai_response_header_timeout must be non-negative")
+	}
+	if c.Gateway.OpenAIReasoningRetry.MinReasoningOutputTokens < 0 {
+		return fmt.Errorf("gateway.openai_reasoning_retry.min_reasoning_output_tokens must be non-negative")
+	}
+	if c.Gateway.OpenAIReasoningRetry.MaxAttempts < 0 {
+		return fmt.Errorf("gateway.openai_reasoning_retry.max_attempts must be non-negative")
+	}
+	if c.Gateway.OpenAIReasoningRetry.Enabled && c.Gateway.OpenAIReasoningRetry.MaxAttempts > 2 {
+		return fmt.Errorf("gateway.openai_reasoning_retry.max_attempts must be 0, 1, or 2")
 	}
 	if strings.TrimSpace(c.Gateway.ConnectionPoolIsolation) != "" {
 		switch c.Gateway.ConnectionPoolIsolation {

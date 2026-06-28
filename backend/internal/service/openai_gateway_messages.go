@@ -1099,5 +1099,8 @@ func copyOpenAIUsageFromResponsesUsage(usage *apicompat.ResponsesUsage) OpenAIUs
 	if usage.InputTokensDetails != nil {
 		result.CacheReadInputTokens = usage.InputTokensDetails.CachedTokens
 	}
+	if usage.OutputTokensDetails != nil {
+		result.ReasoningOutputTokens = usage.OutputTokensDetails.ReasoningTokens
+	}
 	return result
 }

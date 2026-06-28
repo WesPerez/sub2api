@@ -152,6 +152,15 @@ gateway:
   # OpenAI/Codex upstream response header timeout (seconds, 0=disabled)
   # OpenAI/Codex 等待上游响应头超时时间（秒，0=禁用本地响应头超时）
   openai_response_header_timeout: 0
+  # Retry OpenAI Responses once with stronger internal reasoning instructions
+  # when the first successful response reports too few reasoning tokens.
+  # The second response is always returned, even if it is still below the threshold.
+  # 首次成功响应 reasoning token 低于阈值时，追加强制思考指令重试一次；
+  # 第二次结果始终返回，不再拒收。
+  openai_reasoning_retry:
+    enabled: false
+    min_reasoning_output_tokens: 517
+    max_attempts: 2
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456
