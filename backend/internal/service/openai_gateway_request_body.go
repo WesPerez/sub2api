@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
@@ -640,6 +641,108 @@ func normalizeOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, boo
 	}
 
 	return normalized, changed, nil
+}
+
+type OpenAICodexPassthroughLocalError struct {
+	StatusCode int
+	ErrorType  string
+	Message    string
+}
+
+func (e *OpenAICodexPassthroughLocalError) Error() string {
+	if e == nil {
+		return "Codex API-key passthrough validation failed"
+	}
+	return e.Message
+}
+
+func newOpenAICodexPassthroughLocalError(statusCode int, errorType, message string) error {
+	return &OpenAICodexPassthroughLocalError{
+		StatusCode: statusCode,
+		ErrorType:  errorType,
+		Message:    message,
+	}
+}
+
+// normalizeOpenAICodexAPIKeyPassthroughBody adds the installation identity
+// required by Codex-restricted API-key upstreams. The account value represents
+// this gateway installation and is only used when the client did not provide
+// its own valid metadata object.
+func normalizeOpenAICodexAPIKeyPassthroughBody(body []byte, account *Account) ([]byte, bool, error) {
+	if len(body) == 0 || account == nil || !account.IsOpenAICodexAPIKeyUpstream() {
+		return body, false, nil
+	}
+
+	const metadataPath = "client_metadata.x-codex-installation-id"
+	if metadata := gjson.GetBytes(body, "client_metadata"); metadata.Exists() && !metadata.IsObject() {
+		return body, false, newOpenAICodexPassthroughLocalError(
+			http.StatusBadRequest,
+			"invalid_request_error",
+			"client_metadata must be an object for Codex API-key passthrough",
+		)
+	}
+	if existing := gjson.GetBytes(body, metadataPath); existing.Exists() && strings.TrimSpace(existing.String()) != "" {
+		if _, valid := normalizeOpenAICodexInstallationID(existing.String()); !valid {
+			return body, false, newOpenAICodexPassthroughLocalError(
+				http.StatusBadRequest,
+				"invalid_request_error",
+				"client_metadata.x-codex-installation-id must be a UUIDv4",
+			)
+		}
+		return body, false, nil
+	}
+
+	installationID, valid := normalizeOpenAICodexInstallationID(account.GetOpenAIDeviceID())
+	if !valid {
+		return body, false, newOpenAICodexPassthroughLocalError(
+			http.StatusServiceUnavailable,
+			"configuration_error",
+			"Codex API-key upstream requires a configured UUIDv4 installation identity",
+		)
+	}
+
+	normalized, err := sjson.SetBytes(body, metadataPath, installationID)
+	if err != nil {
+		return body, false, fmt.Errorf("normalize Codex API-key installation metadata: %w", err)
+	}
+	return normalized, true, nil
+}
+
+func isOpenAISharedChatCodexAPIKeyUpstream(account *Account) bool {
+	if account == nil || !account.IsOpenAICodexAPIKeyUpstream() {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(account.GetOpenAIBaseURL()))
+	return err == nil && strings.EqualFold(strings.TrimSuffix(parsed.Hostname(), "."), "new.sharedchat.cc")
+}
+
+func openAIHTTPUpstreamProfileForAccount(account *Account) HTTPUpstreamProfile {
+	if isOpenAISharedChatCodexAPIKeyUpstream(account) {
+		return HTTPUpstreamProfileOpenAIHTTP1
+	}
+	return HTTPUpstreamProfileOpenAI
+}
+
+func normalizeOpenAISharedChatMaxEffort(body []byte, account *Account) ([]byte, bool, error) {
+	if len(body) == 0 || !isOpenAISharedChatCodexAPIKeyUpstream(account) ||
+		!strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "model").String()), "gpt-5.6-sol") ||
+		!strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").String()), "max") {
+		return body, false, nil
+	}
+
+	normalized, err := sjson.SetBytes(body, "reasoning.effort", "xhigh")
+	if err != nil {
+		return body, false, fmt.Errorf("normalize sharedchat Codex reasoning effort: %w", err)
+	}
+	return normalized, true, nil
+}
+
+func normalizeOpenAICodexInstallationID(value string) (string, bool) {
+	parsed, err := uuid.Parse(strings.TrimSpace(value))
+	if err != nil || parsed.Version() != 4 || parsed.Variant() != uuid.RFC4122 {
+		return "", false
+	}
+	return parsed.String(), true
 }
 
 func detectOpenAIPassthroughInstructionsRejectReason(reqModel string, body []byte) string {

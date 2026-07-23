@@ -880,7 +880,7 @@ func (s *httpUpstreamService) resolvePoolSettings(isolation string, accountConcu
 }
 
 func (s *httpUpstreamService) applyProfilePoolSettings(settings poolSettings, profile service.HTTPUpstreamProfile) poolSettings {
-	if profile != service.HTTPUpstreamProfileOpenAI {
+	if profile != service.HTTPUpstreamProfileOpenAI && profile != service.HTTPUpstreamProfileOpenAIHTTP1 {
 		return settings
 	}
 	settings.responseHeaderTimeout = 0
@@ -964,6 +964,9 @@ func (s *httpUpstreamService) resolveOpenAIHTTP2Settings() openAIHTTP2Settings {
 }
 
 func (s *httpUpstreamService) resolveProtocolMode(profile service.HTTPUpstreamProfile, proxyKey string, parsedProxy *url.URL) string {
+	if profile == service.HTTPUpstreamProfileOpenAIHTTP1 {
+		return upstreamProtocolModeOpenAIH1
+	}
 	if profile != service.HTTPUpstreamProfileOpenAI {
 		return upstreamProtocolModeDefault
 	}

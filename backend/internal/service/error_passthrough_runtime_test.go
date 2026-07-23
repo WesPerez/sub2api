@@ -8,12 +8,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/Wei-Shaw/sub2api/internal/model"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestApplyErrorPassthroughRule_NoBoundService(t *testing.T) {
@@ -116,6 +118,79 @@ func TestOpenAIHandleErrorResponse_ContextWindow502KeepsMessageWithoutFailover(t
 	require.True(t, ok)
 	assert.Equal(t, "upstream_error", errField["type"])
 	assert.Equal(t, "Your input exceeds the context window of this model. Please adjust your input and try again.", errField["message"])
+}
+
+func TestOpenAIHandleErrorResponse_XAIMaximumPromptLengthMapsToClient400(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	svc := &OpenAIGatewayService{}
+	upstreamMessage := "This model's maximum prompt length is 500000 but the request contains 1678817 tokens."
+	respBody := []byte(`{"code":"invalid-argument","error":"` + upstreamMessage + `"}`)
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(bytes.NewReader(respBody)),
+		Header:     http.Header{},
+	}
+	account := &Account{ID: 15, Platform: PlatformGrok, Type: AccountTypeOAuth}
+
+	_, err := svc.handleErrorResponse(context.Background(), resp, c, account, nil)
+	require.Error(t, err)
+	var failoverErr *UpstreamFailoverError
+	require.False(t, errors.As(err, &failoverErr))
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var payload map[string]any
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &payload))
+	errField, ok := payload["error"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "invalid_request_error", errField["type"])
+	assert.Equal(t, "context_length_exceeded", errField["code"])
+	assert.Equal(t, upstreamMessage, errField["message"])
+}
+
+func TestOpenAIHandleErrorResponse_GrokOrdinaryInvalidArgumentKeepsDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/", nil)
+
+	svc := &OpenAIGatewayService{}
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Body:       io.NopCloser(strings.NewReader(`{"code":"invalid-argument","error":"Unsupported request field."}`)),
+		Header:     http.Header{},
+	}
+	account := &Account{ID: 16, Platform: PlatformGrok, Type: AccountTypeOAuth}
+
+	_, err := svc.handleErrorResponse(context.Background(), resp, c, account, nil)
+	require.Error(t, err)
+	assert.Equal(t, http.StatusBadGateway, rec.Code)
+	assert.Equal(t, "upstream_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+	assert.Equal(t, "Upstream request failed", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
+}
+
+func TestExtractUpstreamErrorMessage_XAITopLevelString(t *testing.T) {
+	assert.Equal(t, "prompt too long", extractUpstreamErrorMessage([]byte(`{"code":"invalid-argument","error":"prompt too long"}`)))
+	assert.Empty(t, extractUpstreamErrorMessage([]byte(`{"error":{"code":"invalid-argument"}}`)))
+	assert.Empty(t, extractUpstreamErrorMessage([]byte(`{"error":false}`)))
+}
+
+func TestIsOpenAIContextWindowError_XAIMaximumPromptLength(t *testing.T) {
+	assert.True(t, isOpenAIContextWindowError(
+		"",
+		[]byte(`{"code":"invalid-argument","error":"This model's maximum prompt length is 500000 but the request contains 1678817 tokens."}`),
+	))
+	assert.False(t, isOpenAIContextWindowError(
+		"invalid argument",
+		[]byte(`{"code":"invalid-argument","error":"Unsupported request field."}`),
+	))
+	assert.False(t, isOpenAIContextWindowError(
+		"",
+		[]byte(`{"code":"invalid-argument","error":"The maximum prompt length is configurable for this request."}`),
+	))
 }
 
 func TestGeminiWriteGeminiMappedError_NoRuleKeepsDefault(t *testing.T) {

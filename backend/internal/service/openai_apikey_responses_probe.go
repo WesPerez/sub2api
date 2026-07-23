@@ -67,6 +67,18 @@ func openaiResponsesProbePayload(modelID string) []byte {
 	return body
 }
 
+func prepareOpenAIResponsesProbeBody(account *Account, modelID string) ([]byte, error) {
+	body := openaiResponsesProbePayload(modelID)
+	if account == nil || !account.IsOpenAICodexAPIKeyUpstream() {
+		return body, nil
+	}
+	normalized, _, err := normalizeOpenAICodexAPIKeyPassthroughBody(body, account)
+	if err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
 // selectResponsesProbeModel 选出用于探测的上游模型。
 //
 // 工具能力探测必须用上游真实存在的模型——用占位模型(DefaultTestModel)打第三方
@@ -139,12 +151,17 @@ func (s *AccountTestService) ProbeOpenAIAPIKeyResponsesSupport(ctx context.Conte
 	probeCtx, cancel := context.WithTimeout(ctx, openaiResponsesProbeTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, probeURL, bytes.NewReader(openaiResponsesProbePayload(probeModel)))
+	probeBody, err := prepareOpenAIResponsesProbeBody(account, probeModel)
+	if err != nil {
+		logger.LegacyPrintf("service.openai_probe", "probe_normalize_request_failed: account_id=%d err=%v", accountID, err)
+		return
+	}
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, probeURL, bytes.NewReader(probeBody))
 	if err != nil {
 		logger.LegacyPrintf("service.openai_probe", "probe_build_request_failed: account_id=%d err=%v", accountID, err)
 		return
 	}
-	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI))
+	req = req.WithContext(WithHTTPUpstreamProfile(req.Context(), openAIHTTPUpstreamProfileForAccount(account)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Accept", "application/json")

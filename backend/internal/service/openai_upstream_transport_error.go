@@ -124,13 +124,18 @@ func (s *OpenAIGatewayService) handleOpenAIUpstreamTransportError(ctx context.Co
 		return err
 	}
 
-	if classifyOpenAITransportError(err).Persistent {
+	transportClass := classifyOpenAITransportError(err)
+	if transportClass.Persistent {
 		s.tempUnscheduleOpenAITransportError(ctx, account, safeErr)
 	}
 
+	// Transport failures have no upstream HTTP response. After normalizing them
+	// to 502, let non-persistent failures honor the account's existing pool retry
+	// status configuration; durable proxy/network faults still switch accounts.
 	return &UpstreamFailoverError{
-		StatusCode:   http.StatusBadGateway,
-		ResponseBody: openAITransportFailoverBody,
+		StatusCode:             http.StatusBadGateway,
+		ResponseBody:           openAITransportFailoverBody,
+		RetryableOnSameAccount: !transportClass.Persistent && account != nil && account.IsPoolMode() && account.IsPoolModeRetryableStatus(http.StatusBadGateway),
 	}
 }
 

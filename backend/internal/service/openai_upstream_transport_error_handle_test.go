@@ -60,7 +60,16 @@ func (u *failingOpenAIHTTPUpstream) DoWithTLS(_ *http.Request, _ string, _ int64
 func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *testing.T) {
 	repo := &openaiTransportAccountRepoStub{}
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	account := &Account{ID: 4627, Name: "proxy-expired", Platform: PlatformOpenAI}
+	account := &Account{
+		ID:       4627,
+		Name:     "proxy-expired",
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"pool_mode":                    true,
+			"pool_mode_retry_status_codes": []any{502},
+		},
+	}
 	c, rec := newOpenAITransportErrTestContext()
 
 	before := time.Now()
@@ -72,6 +81,7 @@ func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *test
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(retErr, &fo), "persistent error must return *UpstreamFailoverError")
 	require.Equal(t, http.StatusBadGateway, fo.StatusCode)
+	require.False(t, fo.RetryableOnSameAccount)
 
 	// Persistent → account temporarily unscheduled for ~10min, reason carries cause.
 	require.Len(t, repo.tempUnschedCalls, 1)
@@ -87,11 +97,21 @@ func TestHandleOpenAIUpstreamTransportError_PersistentEvictsAndFailsOver(t *test
 	require.Equal(t, 0, rec.Body.Len())
 }
 
-// A transient blip should fail over but must NOT evict the account.
-func TestHandleOpenAIUpstreamTransportError_TransientFailsOverWithoutEviction(t *testing.T) {
+// A transient blip should honor the pool retry policy without evicting the account.
+func TestHandleOpenAIUpstreamTransportError_TransientRetriesWithoutEviction(t *testing.T) {
 	repo := &openaiTransportAccountRepoStub{}
 	svc := &OpenAIGatewayService{accountRepo: repo}
-	account := &Account{ID: 99, Name: "flaky", Platform: PlatformOpenAI}
+	account := &Account{
+		ID:       99,
+		Name:     "flaky",
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"pool_mode":                    true,
+			"pool_mode_retry_count":        10,
+			"pool_mode_retry_status_codes": []any{502},
+		},
+	}
 	c, rec := newOpenAITransportErrTestContext()
 
 	err := svc.handleOpenAIUpstreamTransportError(context.Background(), c, account,
@@ -100,11 +120,55 @@ func TestHandleOpenAIUpstreamTransportError_TransientFailsOverWithoutEviction(t 
 	var fo *UpstreamFailoverError
 	require.True(t, errors.As(err, &fo), "transient error must return *UpstreamFailoverError")
 	require.Equal(t, http.StatusBadGateway, fo.StatusCode)
+	require.True(t, fo.RetryableOnSameAccount,
+		"a transient transport 502 must honor the account pool retry status configuration")
 
 	// Transient → do NOT evict.
 	require.Empty(t, repo.tempUnschedCalls)
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 	require.Equal(t, 0, rec.Body.Len())
+}
+
+func TestHandleOpenAIUpstreamTransportError_TransientRetryRequiresConfiguredPool502(t *testing.T) {
+	tests := []struct {
+		name    string
+		account *Account
+	}{
+		{
+			name: "pool default status list",
+			account: &Account{ID: 101, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{
+				"pool_mode": true,
+			}},
+		},
+		{
+			name: "pool explicitly empty status list",
+			account: &Account{ID: 102, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Credentials: map[string]any{
+				"pool_mode":                    true,
+				"pool_mode_retry_status_codes": []any{},
+			}},
+		},
+		{
+			name:    "non-pool API key",
+			account: &Account{ID: 103, Platform: PlatformOpenAI, Type: AccountTypeAPIKey},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := &openaiTransportAccountRepoStub{}
+			svc := &OpenAIGatewayService{accountRepo: repo}
+			c, rec := newOpenAITransportErrTestContext()
+
+			err := svc.handleOpenAIUpstreamTransportError(context.Background(), c, tt.account,
+				errors.New("read: connection reset by peer"), false)
+
+			var fo *UpstreamFailoverError
+			require.True(t, errors.As(err, &fo))
+			require.False(t, fo.RetryableOnSameAccount)
+			require.Empty(t, repo.tempUnschedCalls)
+			require.Equal(t, 0, rec.Body.Len())
+		})
+	}
 }
 
 // context.Canceled means the client disconnected — do NOT fail over to another

@@ -54,7 +54,7 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
 
-	if account != nil && account.Platform == PlatformOpenAI && isOpenAIContextWindowError("", responseBody) {
+	if isOpenAIAccount(account) && isOpenAIContextWindowError("", responseBody) {
 		return false
 	}
 
@@ -91,7 +91,7 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	if shouldDisable && !modelTempMatched {
 		s.BlockAccountScheduling(account, time.Time{}, "upstream_disable")
 	}
-	if !shouldDisable && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && shouldCooldownOpenAITransientUpstreamError(statusCode, responseBody) {
+	if !shouldDisable && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && !account.IsPoolMode() && shouldCooldownOpenAITransientUpstreamError(statusCode, responseBody) {
 		model := ""
 		if len(canonicalModel) > 0 {
 			model = canonicalModel[0]
@@ -286,6 +286,12 @@ func (s *OpenAIGatewayService) clearOpenAIAccountModelTransientState(accountID i
 
 func (s *OpenAIGatewayService) isOpenAIAccountModelRuntimeBlocked(account *Account, requestedModel string) bool {
 	if s == nil || account == nil {
+		return false
+	}
+	// Pool-mode API-key accounts absorb configured transient failures through
+	// request-local retries. Ignore any stale model cooldown so it cannot truncate
+	// the current account's retry budget after the first few attempts.
+	if account.IsPoolMode() {
 		return false
 	}
 	state := s.getOpenAIAccountModelTransientState()

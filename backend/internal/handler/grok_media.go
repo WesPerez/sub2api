@@ -180,6 +180,7 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 	requestCtx := c.Request.Context()
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
+	var sameAccountRetrySelection *service.AccountSelectionResult
 	var lastFailoverErr *service.UpstreamFailoverError
 	var oauth429FailoverState service.OpenAIOAuth429FailoverState
 	mediaEligibilityRejected := false
@@ -195,20 +196,24 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 		if failoverClientGone(c) {
 			return
 		}
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			requestCtx,
-			apiKey.GroupID,
-			"",
-			sessionHash,
-			routingModel,
-			failedAccountIDs,
-			service.OpenAIUpstreamTransportHTTPSSE,
-			requiredCapability,
-			false,
-			false,
-			false,
-			service.PlatformGrok,
-		)
+		selection, scheduleDecision, retryingSameAccount := consumeOpenAISameAccountRetrySelection(&sameAccountRetrySelection)
+		var err error
+		if !retryingSameAccount {
+			selection, scheduleDecision, err = h.gatewayService.SelectAccountWithSchedulerForCapability(
+				requestCtx,
+				apiKey.GroupID,
+				"",
+				sessionHash,
+				routingModel,
+				failedAccountIDs,
+				service.OpenAIUpstreamTransportHTTPSSE,
+				requiredCapability,
+				false,
+				false,
+				false,
+				service.PlatformGrok,
+			)
+		}
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("grok_media.account_select_aborted_client_disconnected", zap.Error(err))
@@ -290,11 +295,23 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 				continue
 			}
 		}
-		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, accountAcquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, false, &streamStarted, reqLog)
 		if !accountAcquired {
+			if selection.SkipStickyBinding && !failoverClientGone(c) {
+				h.gatewayService.RecordOpenAIAccountSwitch()
+				failedAccountIDs[account.ID] = struct{}{}
+				reqLog.Warn("grok_media.pool_same_account_retry_slot_unavailable_switching",
+					zap.Int64("account_id", account.ID),
+				)
+				if switchCount >= maxAccountSwitches {
+					h.handleFailoverExhausted(c, lastFailoverErr, false)
+					return
+				}
+				switchCount++
+				continue
+			}
 			return
 		}
 
@@ -345,8 +362,10 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 				}
 				if failoverErr.RetryableOnSameAccount {
 					retryLimit := account.GetPoolModeRetryCount()
-					if sameAccountRetryCount[account.ID] < retryLimit {
+					pendingRetry := h.gatewayService.NewOpenAISameAccountRetrySelection(account)
+					if pendingRetry != nil && sameAccountRetryCount[account.ID] < retryLimit {
 						sameAccountRetryCount[account.ID]++
+						lastFailoverErr = failoverErr
 						reqLog.Warn("grok_media.pool_mode_same_account_retry",
 							zap.Int64("account_id", account.ID),
 							zap.Int("upstream_status", failoverErr.StatusCode),
@@ -358,6 +377,7 @@ func (h *OpenAIGatewayHandler) handleGrokMedia(c *gin.Context, endpoint service.
 							return
 						case <-time.After(sameAccountRetryDelay):
 						}
+						sameAccountRetrySelection = pendingRetry
 						continue
 					}
 				}

@@ -533,10 +533,12 @@ type AccountWaitPlan struct {
 }
 
 type AccountSelectionResult struct {
-	Account     *Account
-	Acquired    bool
-	ReleaseFunc func()
-	WaitPlan    *AccountWaitPlan // nil means no wait allowed
+	Account               *Account
+	Acquired              bool
+	ReleaseFunc           func()
+	WaitPlan              *AccountWaitPlan // nil means no wait allowed
+	SkipStickyBinding     bool             // request-local retries must not extend a failed sticky binding
+	PreserveStickyBinding bool             // a one-request sticky escape must not replace the existing binding
 }
 
 // ClaudeUsage 表示Claude API返回的usage信息
@@ -605,6 +607,11 @@ const (
 
 type GatewayFailureReason string
 
+const (
+	openAIFirstOutputTimeoutFailureReason GatewayFailureReason = "openai_first_output_timeout"
+	openAIFirstOutputStageFailureReason   GatewayFailureReason = "openai_first_output_stage_limit"
+)
+
 // UpstreamFailoverError indicates an upstream or credential error that may
 // trigger account failover. Additive metadata keeps existing composite literals
 // source-compatible and preserves their legacy retry-next-account behavior.
@@ -632,6 +639,17 @@ func (e *UpstreamFailoverError) Error() string {
 
 func (e *UpstreamFailoverError) ShouldRetryNextAccount() bool {
 	return e != nil && e.NextAccountAction != NextAccountStop
+}
+
+// CountsTowardOpenAIFirstOutputFailoverLimit distinguishes bounded first-output
+// protection failures from ordinary pre-semantic stream failures that merely
+// happened after a transport keepalive was written.
+func (e *UpstreamFailoverError) CountsTowardOpenAIFirstOutputFailoverLimit() bool {
+	if e == nil {
+		return false
+	}
+	return e.Reason == openAIFirstOutputTimeoutFailureReason ||
+		e.Reason == openAIFirstOutputStageFailureReason
 }
 
 func (e *UpstreamFailoverError) IsCredentialFailure() bool {

@@ -42,6 +42,27 @@ func newAntigravityTestService(cfg *config.Config) *AntigravityGatewayService {
 	}
 }
 
+func TestAntigravityTestRequestsUseMeaningfulPromptBudget(t *testing.T) {
+	t.Parallel()
+	svc := &AntigravityGatewayService{}
+	prompt := "Return a JSON object with the sorted labels and their total: beta=3, alpha=4."
+
+	geminiBody, err := svc.buildGeminiTestRequest("project-1", "gemini-3-flash", prompt)
+	require.NoError(t, err)
+	require.Contains(t, string(geminiBody), prompt)
+	require.Contains(t, string(geminiBody), `"maxOutputTokens":256`)
+
+	claudeBody, err := svc.buildClaudeTestRequest("project-1", "claude-sonnet-4-5-thinking", prompt)
+	require.NoError(t, err)
+	require.Contains(t, string(claudeBody), "sorted labels")
+	require.Contains(t, string(claudeBody), `"maxOutputTokens":256`)
+
+	_, err = svc.buildGeminiTestRequest("project-1", "gemini-3-flash", "")
+	require.Error(t, err)
+	_, err = svc.buildClaudeTestRequest("project-1", "claude-sonnet-4-5-thinking", "")
+	require.Error(t, err)
+}
+
 func TestAntigravityUpstreamErrorBodyReadLimit_RespectsDiagnosticLimit(t *testing.T) {
 	svc := newAntigravityTestService(&config.Config{Gateway: config.GatewayConfig{
 		LogUpstreamErrorBody:         true,

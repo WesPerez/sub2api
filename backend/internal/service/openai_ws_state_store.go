@@ -110,7 +110,7 @@ func (s *defaultOpenAIWSStateStore) BindResponseAccount(ctx context.Context, gro
 		return nil
 	}
 	cacheKey := openAIWSResponseAccountCacheKey(id)
-	cacheCtx, cancel := withOpenAIWSStateStoreRedisTimeout(ctx)
+	cacheCtx, cancel := withOpenAIWSStateStoreBindRedisTimeout(ctx)
 	defer cancel()
 	return s.cache.SetSessionAccountID(cacheCtx, groupID, cacheKey, accountID, ttl)
 }
@@ -444,4 +444,11 @@ func withOpenAIWSStateStoreRedisTimeout(ctx context.Context) (context.Context, c
 		ctx = context.Background()
 	}
 	return context.WithTimeout(ctx, openAIWSStateStoreRedisTimeout)
+}
+
+func withOpenAIWSStateStoreBindRedisTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), openAIWSStateStoreRedisTimeout)
 }

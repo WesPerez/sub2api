@@ -51,18 +51,17 @@ func TestAccountTestService_TestAccountConnection_GrokUsesXAIResponses(t *testin
 	repo := &mockAccountRepoForGemini{
 		accountsByID: map[int64]*Account{account.ID: account},
 	}
+	probe := newFixedAccountTestProbe()
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
-				"data: {\"type\":\"response.completed\"}\n\n",
-		)),
+		Body: io.NopCloser(strings.NewReader(openAIProbeSuccessStream(probe))),
 	}}
 	svc := &AccountTestService{
 		accountRepo:       repo,
 		grokTokenProvider: NewGrokTokenProvider(repo, nil),
 		httpUpstream:      upstream,
+		testProbeFactory:  fixedAccountTestProbeFactory(probe),
 	}
 
 	rec := httptest.NewRecorder()
@@ -77,7 +76,7 @@ func TestAccountTestService_TestAccountConnection_GrokUsesXAIResponses(t *testin
 	require.Equal(t, grokCLIVersion, upstream.lastReq.Header.Get("X-Grok-Client-Version"))
 	require.Equal(t, "application/json, text/event-stream", upstream.lastReq.Header.Get("Accept"))
 	require.Equal(t, "grok-4.3", gjson.GetBytes(upstream.lastBody, "model").String())
-	require.Equal(t, grokQuotaProbeInput, gjson.GetBytes(upstream.lastBody, "input").String())
+	require.Equal(t, probe.Prompt, gjson.GetBytes(upstream.lastBody, "input").String())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "max_output_tokens").Exists())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "store").Exists())
@@ -104,18 +103,17 @@ func TestAccountTestService_TestAccountConnection_GrokDefaultsEmptyModelTo45(t *
 		},
 	}
 	repo := &mockAccountRepoForGemini{accountsByID: map[int64]*Account{account.ID: account}}
+	probe := newFixedAccountTestProbe()
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
-				"data: {\"type\":\"response.completed\"}\n\n",
-		)),
+		Body: io.NopCloser(strings.NewReader(openAIProbeSuccessStream(probe))),
 	}}
 	svc := &AccountTestService{
 		accountRepo:       repo,
 		grokTokenProvider: NewGrokTokenProvider(repo, nil),
 		httpUpstream:      upstream,
+		testProbeFactory:  fixedAccountTestProbeFactory(probe),
 	}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
@@ -198,4 +196,72 @@ func TestAccountTestService_Grok429WithoutQuotaHeadersUsesFallback(t *testing.T)
 	require.Error(t, err)
 	require.Equal(t, 1, repo.rateLimitedCalls)
 	require.WithinDuration(t, before.Add(grokRateLimitFallbackCooldown), repo.resetAt, time.Second)
+}
+
+func TestAccountTestService_Grok429FreeUsageUsesRollingCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := &Account{
+		ID: 17, Name: "grok-oauth-free-usage", Platform: PlatformGrok,
+		Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token":  "grok-access-token",
+			"refresh_token": "grok-refresh-token",
+			"expires_at":    time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	baseRepo := &mockAccountRepoForGemini{accountsByID: map[int64]*Account{account.ID: account}}
+	repo := &grokAccountTestRateLimitRepo{mockAccountRepoForGemini: baseRepo}
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Body: io.NopCloser(strings.NewReader(
+			`{"error":"You've used all the included free usage. Usage resets over a rolling 24-hour window"}`,
+		)),
+	}}
+	svc := &AccountTestService{
+		accountRepo: repo, grokTokenProvider: NewGrokTokenProvider(repo, nil), httpUpstream: upstream,
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/17/test", nil)
+	before := time.Now()
+
+	err := svc.TestAccountConnection(c, account.ID, "grok", "", AccountTestModeDefault)
+
+	require.Error(t, err)
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.WithinDuration(t, before.Add(grokFreeUsageRollingWindowCooldown), repo.resetAt, time.Second)
+}
+
+func TestAccountTestService_Grok402SpendingLimitUsesRollingCooldown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	account := &Account{
+		ID: 18, Name: "grok-oauth-spending-limit", Platform: PlatformGrok,
+		Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token":  "grok-access-token",
+			"refresh_token": "grok-refresh-token",
+			"expires_at":    time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+	baseRepo := &mockAccountRepoForGemini{accountsByID: map[int64]*Account{account.ID: account}}
+	repo := &grokAccountTestRateLimitRepo{mockAccountRepoForGemini: baseRepo}
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusPaymentRequired,
+		Body: io.NopCloser(strings.NewReader(
+			`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`,
+		)),
+	}}
+	svc := &AccountTestService{
+		accountRepo: repo, grokTokenProvider: NewGrokTokenProvider(repo, nil), httpUpstream: upstream,
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/18/test", nil)
+	before := time.Now()
+
+	err := svc.TestAccountConnection(c, account.ID, "grok", "", AccountTestModeDefault)
+
+	require.Error(t, err)
+	require.Equal(t, 1, repo.rateLimitedCalls)
+	require.WithinDuration(t, before.Add(grokFreeUsageRollingWindowCooldown), repo.resetAt, time.Second)
 }

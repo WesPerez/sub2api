@@ -1395,7 +1395,7 @@ func (a *Account) IsChatGPTAccountFedRAMP() bool {
 }
 
 func (a *Account) GetOpenAIDeviceID() string {
-	if !a.IsOpenAIOAuth() {
+	if !a.IsOpenAIOAuth() && !a.IsOpenAICodexAPIKeyUpstream() {
 		return ""
 	}
 	return strings.TrimSpace(a.GetExtraString("openai_device_id"))
@@ -1658,6 +1658,20 @@ func (a *Account) IsOpenAIPassthroughEnabled() bool {
 		return enabled
 	}
 	return false
+}
+
+// IsOpenAICodexAPIKeyUpstream reports whether an API-key account targets a
+// fully configured Codex-style Responses endpoint.
+func (a *Account) IsOpenAICodexAPIKeyUpstream() bool {
+	if a == nil || a.Platform != PlatformOpenAI || a.Type != AccountTypeAPIKey {
+		return false
+	}
+	baseURL := strings.ToLower(strings.TrimRight(strings.TrimSpace(a.GetOpenAIBaseURL()), "/"))
+	return strings.HasSuffix(baseURL, "/codex/responses")
+}
+
+func (a *Account) IsOpenAICodexAPIKeyPassthrough() bool {
+	return a.IsOpenAICodexAPIKeyUpstream() && a.IsOpenAIPassthroughEnabled()
 }
 
 // IsOpenAIResponsesWebSocketV2Enabled 返回 OpenAI 账号是否开启 Responses WebSocket v2。

@@ -863,6 +863,16 @@ func (c *schedulerCache) mgetChunked(ctx context.Context, keys []string) ([]any,
 }
 
 func buildSchedulerMetadataAccount(account service.Account) service.Account {
+	credentials := filterSchedulerCredentials(account.Credentials)
+	if account.IsAPIKeyOrBedrock() {
+		if credentials == nil {
+			credentials = make(map[string]any, 1)
+		}
+		// Pool membership is scheduling metadata, not a credential. Project the
+		// boolean so callers do not need the full credential snapshot merely to
+		// distinguish a managed pool from a mixed group.
+		credentials["pool_mode"] = account.IsPoolMode()
+	}
 	return service.Account{
 		ID:                      account.ID,
 		Name:                    account.Name,
@@ -889,7 +899,7 @@ func buildSchedulerMetadataAccount(account service.Account) service.Account {
 		QuotaDimension:          account.QuotaDimension,
 		AccountGroups:           filterSchedulerAccountGroups(account.AccountGroups),
 		GroupIDs:                filterSchedulerGroupIDs(account.GroupIDs, account.AccountGroups),
-		Credentials:             filterSchedulerCredentials(account.Credentials),
+		Credentials:             credentials,
 		Extra:                   filterSchedulerExtra(account.Extra),
 	}
 }

@@ -84,10 +84,16 @@ func TestIsGrokContentPolicyRejection(t *testing.T) {
 			want:   true,
 		},
 		{
-			name:   "wrong status",
+			name:   "structured policy survives wrapper status",
 			status: http.StatusBadRequest,
 			body:   `{"error":{"code":"new_sensitive"}}`,
-			want:   false,
+			want:   true,
+		},
+		{
+			name:   "sensitive words wrapped as server error",
+			status: http.StatusInternalServerError,
+			body:   `{"error":{"code":"sensitive_words_detected","message":"request rejected"}}`,
+			want:   true,
 		},
 	}
 

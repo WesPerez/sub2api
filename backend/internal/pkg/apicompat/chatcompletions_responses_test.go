@@ -1548,6 +1548,49 @@ func TestBufferedResponseAccumulator_ToolCalls(t *testing.T) {
 	assert.Equal(t, `{"city":"NYC"}`, output[0].Arguments)
 }
 
+func TestBufferedResponseAccumulator_ToolCallDoneEventsReplacePartialArguments(t *testing.T) {
+	acc := NewBufferedResponseAccumulator()
+	acc.ProcessEvent(&ResponsesStreamEvent{
+		Type:        "response.output_item.added",
+		OutputIndex: 0,
+		Item: &ResponsesOutput{
+			Type:   "function_call",
+			ID:     "item_1",
+			CallID: "call_1",
+			Name:   "exec",
+			Status: "in_progress",
+		},
+	})
+	acc.ProcessEvent(&ResponsesStreamEvent{
+		Type:        "response.function_call_arguments.delta",
+		OutputIndex: 0,
+		Delta:       `{"input":"par`,
+	})
+	acc.ProcessEvent(&ResponsesStreamEvent{
+		Type:        "response.function_call_arguments.done",
+		OutputIndex: 0,
+		Arguments:   `{"input":"pwd"}`,
+	})
+	acc.ProcessEvent(&ResponsesStreamEvent{
+		Type:        "response.output_item.done",
+		OutputIndex: 0,
+		Item: &ResponsesOutput{
+			Type:      "function_call",
+			ID:        "item_1",
+			CallID:    "call_1",
+			Name:      "exec",
+			Arguments: `{"input":"pwd"}`,
+			Status:    "completed",
+		},
+	})
+
+	output := acc.BuildOutput()
+	require.Len(t, output, 1)
+	assert.Equal(t, "item_1", output[0].ID)
+	assert.Equal(t, "completed", output[0].Status)
+	assert.Equal(t, `{"input":"pwd"}`, output[0].Arguments)
+}
+
 func TestBufferedResponseAccumulator_Reasoning(t *testing.T) {
 	acc := NewBufferedResponseAccumulator()
 

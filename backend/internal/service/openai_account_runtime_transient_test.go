@@ -114,3 +114,64 @@ func TestHandleOpenAITransientError_HardDisableStillBlocksWholeAccount(t *testin
 	require.True(t, svc.isOpenAIAccountRequestRuntimeBlocked(account, "gpt-5.5"))
 	require.True(t, svc.isOpenAIAccountRequestRuntimeBlocked(account, "gpt-5.6-sol"))
 }
+
+func TestHandleOpenAITransientError_PoolModeSkipsModelCooldown(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	svc.rateLimitService = NewRateLimitService(transientCooldownAccountRepo{}, nil, &config.Config{}, nil, nil)
+	account := &Account{
+		ID:       5201,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"pool_mode":             true,
+			"pool_mode_retry_count": float64(10),
+			"pool_mode_retry_status_codes": []any{
+				float64(429), float64(500), float64(502), float64(503), float64(504), float64(529),
+			},
+		},
+	}
+	// A stale cooldown may exist from before pool mode was enabled or from a
+	// concurrent attempt. Pool-mode scheduling must ignore it.
+	svc.recordOpenAIAccountModelTransientFailure(account, "gpt-5.6-sol", time.Now())
+	svc.recordOpenAIAccountModelTransientFailure(account, "gpt-5.6-sol", time.Now())
+	require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-5.6-sol"))
+
+	for attempt := 1; attempt <= 10; attempt++ {
+		shouldDisable := svc.handleOpenAIAccountUpstreamError(
+			context.Background(),
+			account,
+			http.StatusInternalServerError,
+			http.Header{},
+			[]byte(`{"error":{"message":"temporary upstream failure"}}`),
+			"gpt-5.6-sol",
+		)
+		require.False(t, shouldDisable, "attempt %d should not hard-disable pool account", attempt)
+		require.False(t, svc.isOpenAIAccountRuntimeBlocked(account), "attempt %d must not account-block pool mode", attempt)
+		require.False(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-5.6-sol"), "attempt %d must not model-cooldown pool mode", attempt)
+		require.False(t, svc.isOpenAIAccountRequestRuntimeBlocked(account, "gpt-5.6-sol"), "attempt %d must stay request-schedulable", attempt)
+	}
+}
+
+func TestHandleOpenAITransientError_NonPoolModeStillModelCooldown(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	svc.rateLimitService = NewRateLimitService(transientCooldownAccountRepo{}, nil, &config.Config{}, nil, nil)
+	account := &Account{
+		ID:       5202,
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+	}
+
+	for range 2 {
+		svc.handleOpenAIAccountUpstreamError(
+			context.Background(),
+			account,
+			http.StatusBadGateway,
+			http.Header{},
+			[]byte(`{"error":{"message":"temporary upstream failure"}}`),
+			"gpt-5.6-sol",
+		)
+	}
+
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIAccountModelRuntimeBlocked(account, "gpt-5.6-sol"))
+}

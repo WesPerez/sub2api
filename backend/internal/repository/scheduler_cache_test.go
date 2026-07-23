@@ -37,6 +37,37 @@ func TestSchedulerMetadataAccountKeepsOpenAISubscriptionIdentity(t *testing.T) {
 	require.Empty(t, metadata.GetCredential("access_token"))
 }
 
+func TestSchedulerMetadataAccountProjectsPoolModeWithoutSecrets(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		enabled  bool
+		wantPool bool
+	}{
+		{name: "pool", enabled: true, wantPool: true},
+		{name: "ordinary", enabled: false, wantPool: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			account := service.Account{
+				ID:       25,
+				Platform: service.PlatformOpenAI,
+				Type:     service.AccountTypeAPIKey,
+				Credentials: map[string]any{
+					"pool_mode":     tt.enabled,
+					"access_token":  "secret-access-token",
+					"refresh_token": "secret-refresh-token",
+				},
+			}
+
+			metadata := buildSchedulerMetadataAccount(account)
+
+			require.Equal(t, tt.wantPool, metadata.IsPoolMode())
+			require.Equal(t, tt.wantPool, metadata.Credentials["pool_mode"])
+			require.NotContains(t, metadata.Credentials, "access_token")
+			require.NotContains(t, metadata.Credentials, "refresh_token")
+		})
+	}
+}
+
 func TestSchedulerMetadataAccountProjectsUpstreamBillingProbe(t *testing.T) {
 	lastError := strings.Repeat("upstream diagnostic ", 512)
 	probe := map[string]any{

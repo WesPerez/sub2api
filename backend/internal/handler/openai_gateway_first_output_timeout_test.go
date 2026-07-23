@@ -28,13 +28,24 @@ func TestOpenAIForwardMayFailoverOnlyAfterNonSemanticWrite(t *testing.T) {
 }
 
 func TestOpenAIFirstOutputFailoverStopsAfterOneAccountSwitch(t *testing.T) {
-	failoverErr := &service.UpstreamFailoverError{SafeToFailoverAfterWrite: true}
+	failoverErr := &service.UpstreamFailoverError{
+		SafeToFailoverAfterWrite: true,
+		Reason:                   service.GatewayFailureReason("openai_first_output_timeout"),
+	}
 	count := 0
 
 	require.False(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
 	require.Equal(t, 1, count)
 	require.True(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
 	require.Equal(t, 1, count)
+}
+
+func TestOpenAIKeepaliveSafeReplayDoesNotConsumeFirstOutputFailoverBudget(t *testing.T) {
+	failoverErr := &service.UpstreamFailoverError{SafeToFailoverAfterWrite: true}
+	count := 0
+
+	require.False(t, openAIFirstOutputFailoverExhausted(failoverErr, &count))
+	require.Equal(t, 0, count)
 }
 
 func TestOpenAIRequestAllowsFailoverReplayStopsCanceledClient(t *testing.T) {

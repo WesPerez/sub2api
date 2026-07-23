@@ -1900,15 +1900,13 @@ func TestAccountTestServiceGrokAPIKeyUsesXAIResponses(t *testing.T) {
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
-				"data: {\"type\":\"response.completed\"}\n\n",
-		)),
+		Body:       io.NopCloser(strings.NewReader(openAIProbeSuccessStream(newFixedAccountTestProbe()))),
 	}}
 	svc := &AccountTestService{httpUpstream: upstream}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/54/test", nil)
+	c.Request = c.Request.WithContext(withAccountTestProbe(c.Request.Context(), newFixedAccountTestProbe()))
 
 	err := svc.testGrokAccountConnection(c, account, "grok")
 	require.NoError(t, err)
@@ -1934,15 +1932,13 @@ func TestAccountTestServiceGrokAPIKeyAllowsConfiguredHTTPWhenGlobalPolicyDoes(t 
 	upstream := &httpUpstreamRecorder{resp: &http.Response{
 		StatusCode: http.StatusOK,
 		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
-		Body: io.NopCloser(strings.NewReader(
-			"data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
-				"data: {\"type\":\"response.completed\"}\n\n",
-		)),
+		Body:       io.NopCloser(strings.NewReader(openAIProbeSuccessStream(newFixedAccountTestProbe()))),
 	}}
 	svc := &AccountTestService{cfg: rawChatCompletionsTestConfig(), httpUpstream: upstream}
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/55/test", nil)
+	c.Request = c.Request.WithContext(withAccountTestProbe(c.Request.Context(), newFixedAccountTestProbe()))
 
 	err := svc.testGrokAccountConnection(c, account, "grok")
 	require.NoError(t, err)

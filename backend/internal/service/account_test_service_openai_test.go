@@ -58,6 +58,8 @@ func newTestContext() (*gin.Context, *httptest.ResponseRecorder) {
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/admin/accounts/1/test", nil)
+	probe := newFixedAccountTestProbe()
+	c.Request = c.Request.WithContext(withAccountTestProbe(c.Request.Context(), probe))
 	return c, rec
 }
 
@@ -106,9 +108,7 @@ func TestAccountTestService_OpenAISuccessPersistsSnapshotFromHeaders(t *testing.
 	ctx, recorder := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(openAIProbeSuccessStream(newFixedAccountTestProbe())))
 	resp.Header.Set("x-codex-primary-used-percent", "88")
 	resp.Header.Set("x-codex-primary-reset-after-seconds", "604800")
 	resp.Header.Set("x-codex-primary-window-minutes", "10080")
@@ -142,9 +142,7 @@ func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	ctx, _ := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(openAIProbeSuccessStream(newFixedAccountTestProbe())))
 
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
 	svc := &AccountTestService{httpUpstream: upstream}
@@ -169,10 +167,9 @@ func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *t
 	gin.SetMode(gin.TestMode)
 	ctx, recorder := newTestContext()
 
+	probe := newFixedAccountTestProbe()
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(openAIProbeSuccessStream(probe)))
 
 	parentID := int64(100)
 	parent := &Account{
@@ -209,7 +206,11 @@ func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *t
 		},
 	}
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream}
+	svc := &AccountTestService{
+		accountRepo:      repo,
+		httpUpstream:     upstream,
+		testProbeFactory: fixedAccountTestProbeFactory(probe),
+	}
 
 	err := svc.TestAccountConnection(ctx, shadow.ID, "gpt-5.3-codex-spark", "", "")
 	require.NoError(t, err)
@@ -228,7 +229,7 @@ func TestAccountTestService_OpenAIStreamEOFBeforeCompletedFails(t *testing.T) {
 	ctx, recorder := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.output_text.delta","delta":"hi"}
+	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.output_text.delta","delta":"partial output"}
 
 `))
 
@@ -245,6 +246,49 @@ func TestAccountTestService_OpenAIStreamEOFBeforeCompletedFails(t *testing.T) {
 	err := svc.testOpenAIAccountConnection(ctx, account, "gpt-5.4", "", "")
 	require.Error(t, err)
 	require.Contains(t, recorder.Body.String(), "response.completed")
+	require.NotContains(t, recorder.Body.String(), `"success":true`)
+}
+
+func TestAccountTestService_OpenAICompletedEventCarriesFinalProbeText(t *testing.T) {
+	gintest, recorder := newTestContext()
+	probe := newFixedAccountTestProbe()
+	gintest.Request = gintest.Request.WithContext(withAccountTestProbe(gintest.Request.Context(), probe))
+	completed := fmt.Sprintf(
+		`data: {"type":"response.completed","response":{"output":[{"content":[{"type":"output_text","text":%q}]}]}}`+"\n\n",
+		expectedJSONForProbe(probe),
+	)
+
+	svc := &AccountTestService{}
+	err := svc.processOpenAIStream(gintest, strings.NewReader(completed))
+
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), `"success":true`)
+}
+
+func TestAccountTestService_OpenAIDoneEventCarriesFinalProbeText(t *testing.T) {
+	gintest, recorder := newTestContext()
+	probe := newFixedAccountTestProbe()
+	gintest.Request = gintest.Request.WithContext(withAccountTestProbe(gintest.Request.Context(), probe))
+	done := fmt.Sprintf(
+		`data: {"type":"response.done","response":{"output":[{"content":[{"type":"output_text","text":%q}]}]}}`+"\n\n",
+		expectedJSONForProbe(probe),
+	)
+
+	err := (&AccountTestService{}).processOpenAIStream(gintest, strings.NewReader(done))
+
+	require.NoError(t, err)
+	require.Contains(t, recorder.Body.String(), `"success":true`)
+}
+
+func TestAccountTestService_OpenAITerminalEventRejectsMeaninglessOutput(t *testing.T) {
+	gintest, recorder := newTestContext()
+	stream := "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+		"data: {\"type\":\"response.done\"}\n\n"
+
+	err := (&AccountTestService{}).processOpenAIStream(gintest, strings.NewReader(stream))
+
+	require.Error(t, err)
+	require.Contains(t, recorder.Body.String(), "semantic check failed")
 	require.NotContains(t, recorder.Body.String(), `"success":true`)
 }
 
@@ -429,7 +473,7 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUsesCodexProbeHeaders(t *testin
 	ctx, _ := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
+	resp.Body = io.NopCloser(strings.NewReader(openAIProbeSuccessStream(newFixedAccountTestProbe())))
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
 	svc := &AccountTestService{
 		httpUpstream: upstream,
@@ -453,14 +497,19 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUsesCodexProbeHeaders(t *testin
 	req := upstream.requests[0]
 	require.Equal(t, "https://compat-upstream.example/v1/responses", req.URL.String())
 	requireOpenAICodexProbeHeaders(t, req.Header)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.Equal(t, newFixedAccountTestProbe().Prompt, gjson.GetBytes(body, "input.0.content.0.text").String())
+	require.Equal(t, int64(256), gjson.GetBytes(body, "max_output_tokens").Int())
 }
 
 func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsPath(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx, recorder := newTestContext()
 
+	probeText := expectedJSONForProbe(newFixedAccountTestProbe())
 	upstreamBody := strings.Join([]string{
-		`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}`,
+		fmt.Sprintf(`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":%q},"finish_reason":null}]}`, probeText),
 		"",
 		`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 		"",
@@ -488,7 +537,7 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsP
 		Extra: map[string]any{openai_compat.ExtraKeyResponsesSupported: false},
 	}
 
-	err := svc.testOpenAIAccountConnection(ctx, account, "gpt-5.4", "hello", "")
+	err := svc.testOpenAIAccountConnection(ctx, account, "gpt-5.4", "caller-supplied-text-is-ignored", "")
 	require.NoError(t, err)
 	require.NotNil(t, upstream.lastReq)
 	require.Equal(t, HTTPUpstreamProfileOpenAI, HTTPUpstreamProfileFromContext(upstream.lastReq.Context()))
@@ -497,10 +546,10 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsP
 	require.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
 	require.Equal(t, "gpt-5.4", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
-	require.Equal(t, "hello", gjson.GetBytes(upstream.lastBody, "messages.0.content").String())
+	require.Equal(t, newFixedAccountTestProbe().Prompt, gjson.GetBytes(upstream.lastBody, "messages.0.content").String())
 	require.False(t, gjson.GetBytes(upstream.lastBody, "input").Exists())
 	body := recorder.Body.String()
-	require.Contains(t, body, "pong")
+	require.Contains(t, body, `\"sum\":9`)
 	require.Contains(t, body, "已通过 /v1/chat/completions 验证")
 	require.Contains(t, body, `"success":true`)
 	require.NotContains(t, body, "当前测试接口仅支持 Responses API 路径")

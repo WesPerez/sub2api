@@ -703,7 +703,14 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 		return nil, fmt.Errorf("no access token available")
 	}
 	modelID := openaipkg.DefaultTestModel
-	payload := createOpenAITestPayload(modelID, true)
+	probe, err := NewAccountTestProbe()
+	if err != nil {
+		return nil, fmt.Errorf("create openai usage probe: %w", err)
+	}
+	payload, err := createOpenAITestPayload(modelID, true, probe.Prompt)
+	if err != nil {
+		return nil, fmt.Errorf("create openai usage probe payload: %w", err)
+	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal openai probe payload: %w", err)

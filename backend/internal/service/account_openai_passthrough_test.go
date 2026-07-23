@@ -324,3 +324,62 @@ func TestAccount_OpenAIWSExtraFlags(t *testing.T) {
 	}
 	require.False(t, nonOpenAI.IsOpenAIWSAllowStoreRecoveryEnabled())
 }
+
+func TestAccount_IsOpenAICodexAPIKeyPassthrough(t *testing.T) {
+	t.Run("codex path with passthrough enabled", func(t *testing.T) {
+		account := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Credentials: map[string]any{
+				"base_url": "https://new.sharedchat.cc/codex/responses/",
+			},
+			Extra: map[string]any{"openai_passthrough": true},
+		}
+		require.True(t, account.IsOpenAICodexAPIKeyPassthrough())
+	})
+
+	t.Run("ordinary passthrough remains unchanged", func(t *testing.T) {
+		account := &Account{
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Credentials: map[string]any{"base_url": "https://api.openai.com"},
+			Extra:       map[string]any{"openai_passthrough": true},
+		}
+		require.False(t, account.IsOpenAICodexAPIKeyPassthrough())
+	})
+
+	t.Run("codex endpoint still requires explicit passthrough", func(t *testing.T) {
+		account := &Account{
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Credentials: map[string]any{"base_url": "https://new.sharedchat.cc/codex/responses"},
+		}
+		require.False(t, account.IsOpenAICodexAPIKeyPassthrough())
+	})
+
+	t.Run("partial codex path is not treated as a configured endpoint", func(t *testing.T) {
+		account := &Account{
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Credentials: map[string]any{"base_url": "https://new.sharedchat.cc/codex"},
+			Extra:       map[string]any{"openai_passthrough": true},
+		}
+		require.False(t, account.IsOpenAICodexAPIKeyPassthrough())
+	})
+}
+
+func TestOpenAIHTTPUpstreamProfileForAccount(t *testing.T) {
+	sharedChat := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Credentials: map[string]any{"base_url": "https://new.sharedchat.cc/codex/responses"},
+	}
+	require.Equal(t, HTTPUpstreamProfileOpenAIHTTP1, openAIHTTPUpstreamProfileForAccount(sharedChat))
+
+	ordinary := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Credentials: map[string]any{"base_url": "https://api.openai.com/v1"},
+	}
+	require.Equal(t, HTTPUpstreamProfileOpenAI, openAIHTTPUpstreamProfileForAccount(ordinary))
+}

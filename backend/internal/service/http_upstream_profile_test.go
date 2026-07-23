@@ -30,3 +30,10 @@ func TestWithHTTPUpstreamRedirectsDisabled(t *testing.T) {
 		t.Fatal("redirects should remain enabled by default")
 	}
 }
+
+func TestWithHTTPUpstreamProfile_OpenAIHTTP1(t *testing.T) {
+	ctx := WithHTTPUpstreamProfile(context.TODO(), HTTPUpstreamProfileOpenAIHTTP1)
+	if profile := HTTPUpstreamProfileFromContext(ctx); profile != HTTPUpstreamProfileOpenAIHTTP1 {
+		t.Fatalf("expected profile %q, got %q", HTTPUpstreamProfileOpenAIHTTP1, profile)
+	}
+}

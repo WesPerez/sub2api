@@ -148,6 +148,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	switchCount := 0
 	failedAccountIDs := make(map[int64]struct{})
 	sameAccountRetryCount := make(map[int64]int)
+	var sameAccountRetrySelection *service.AccountSelectionResult
 	var lastFailoverErr *service.UpstreamFailoverError
 	stopJSONKeepalive := func() {}
 	jsonKeepaliveStarted := false
@@ -156,14 +157,18 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 
 	for {
 		reqLog.Debug("openai.images.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
-		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForImages(
-			requestCtx,
-			apiKey.GroupID,
-			sessionHash,
-			routingModel,
-			failedAccountIDs,
-			parsed.RequiredCapability,
-		)
+		selection, scheduleDecision, retryingSameAccount := consumeOpenAISameAccountRetrySelection(&sameAccountRetrySelection)
+		var err error
+		if !retryingSameAccount {
+			selection, scheduleDecision, err = h.gatewayService.SelectAccountWithSchedulerForImages(
+				requestCtx,
+				apiKey.GroupID,
+				sessionHash,
+				routingModel,
+				failedAccountIDs,
+				parsed.RequiredCapability,
+			)
+		}
 		if err != nil {
 			if failoverClientGone(c) {
 				reqLog.Info("openai.images.account_select_aborted_client_disconnected", zap.Error(err))
@@ -215,12 +220,24 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		)
 
 		account := selection.Account
-		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai.images.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 
 		accountReleaseFunc, acquired := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, parsed.Stream, &streamStarted, reqLog)
 		if !acquired {
+			if selection.SkipStickyBinding && !failoverClientGone(c) {
+				h.gatewayService.RecordOpenAIAccountSwitch()
+				failedAccountIDs[account.ID] = struct{}{}
+				reqLog.Warn("openai.images.same_account_retry_slot_unavailable_switching",
+					zap.Int64("account_id", account.ID),
+				)
+				if switchCount >= maxAccountSwitches {
+					h.handleFailoverExhausted(c, lastFailoverErr, streamStarted)
+					return
+				}
+				switchCount++
+				continue
+			}
 			return
 		}
 
@@ -294,9 +311,11 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 					}
 					if failoverErr.RetryableOnSameAccount {
 						retryLimit := account.GetPoolModeRetryCount()
-						if sameAccountRetryCount[account.ID] < retryLimit {
+						pendingRetry := h.gatewayService.NewOpenAISameAccountRetrySelection(account)
+						if pendingRetry != nil && sameAccountRetryCount[account.ID] < retryLimit {
 							sameAccountRetryCount[account.ID]++
-							reqLog.Warn("openai.images.pool_mode_same_account_retry",
+							lastFailoverErr = failoverErr
+							reqLog.Warn("openai.images.same_account_retry",
 								zap.Int64("account_id", account.ID),
 								zap.Int("upstream_status", failoverErr.StatusCode),
 								zap.Int("retry_limit", retryLimit),
@@ -307,6 +326,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 								return
 							case <-time.After(sameAccountRetryDelay):
 							}
+							sameAccountRetrySelection = pendingRetry
 							continue
 						}
 					}

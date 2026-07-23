@@ -967,6 +967,49 @@ func TestOpenAISelectAccountWithLoadAwareness_StickyWaitPlan(t *testing.T) {
 	}
 }
 
+func TestGrokSelectAccountWithLoadAwareness_BusyStickyUsesFreePoolAccount(t *testing.T) {
+	sessionHash := "grok-sticky-busy"
+	groupID := int64(5)
+	repo := stubOpenAIAccountRepo{
+		accounts: []Account{
+			{ID: 1, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1},
+			{ID: 2, Platform: PlatformGrok, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Concurrency: 1, Priority: 1},
+		},
+	}
+	cache := &stubGatewayCache{
+		sessionBindings: map[string]int64{"openai:" + sessionHash: 1},
+	}
+	concurrencyCache := stubConcurrencyCache{
+		acquireResults: map[int64]bool{1: false, 2: true},
+		loadMap: map[int64]*AccountLoadInfo{
+			1: {AccountID: 1, LoadRate: 100},
+			2: {AccountID: 2, LoadRate: 0},
+		},
+	}
+	cfg := &config.Config{}
+	cfg.Gateway.Scheduling.StickySessionMaxWaiting = 3
+	cfg.Gateway.Scheduling.StickySessionWaitTimeout = 120 * time.Second
+	cfg.Gateway.Scheduling.FallbackMaxWaiting = 100
+	cfg.Gateway.Scheduling.FallbackWaitTimeout = 30 * time.Second
+	cfg.Gateway.Scheduling.LoadBatchEnabled = true
+
+	svc := &OpenAIGatewayService{
+		accountRepo:        repo,
+		cache:              cache,
+		cfg:                cfg,
+		concurrencyService: NewConcurrencyService(concurrencyCache),
+	}
+
+	selection, err := svc.selectAccountWithLoadAwareness(context.Background(), &groupID, PlatformGrok, sessionHash, "grok-4.5", nil, false, "", true)
+	require.NoError(t, err)
+	require.NotNil(t, selection)
+	require.True(t, selection.Acquired)
+	require.Nil(t, selection.WaitPlan)
+	require.NotNil(t, selection.Account)
+	require.Equal(t, int64(2), selection.Account.ID)
+	require.Equal(t, int64(2), cache.sessionBindings["openai:"+sessionHash])
+}
+
 func TestOpenAISelectAccountWithLoadAwareness_PrefersLowerLoad(t *testing.T) {
 	groupID := int64(1)
 	repo := stubOpenAIAccountRepo{
@@ -1556,6 +1599,24 @@ func TestOpenAIStreamingResponseFailedBeforeOutputServerOverloadedCodeReturnsFai
 	require.Contains(t, string(failoverErr.ResponseBody), "Please retry later")
 	require.False(t, c.Writer.Written())
 	require.Empty(t, rec.Body.String())
+}
+
+func TestOpenAIStreamFailedCapacityAndOverloadedMapToFailover502(t *testing.T) {
+	capacity := []byte(`{"type":"response.failed","error":{"message":"Selected model is at capacity. Please try a different model.","type":"invalid_request_error"}}`)
+	require.True(t, openAIStreamFailedEventShouldFailover(capacity, "Selected model is at capacity. Please try a different model."))
+	require.Equal(t, http.StatusBadGateway, openAIStreamFailedEventSemanticStatus(capacity, "Selected model is at capacity. Please try a different model."))
+
+	overloaded := []byte(`{"type":"response.failed","response":{"id":"resp_1","error":{"code":"server_is_overloaded","message":"Please retry later."}}}`)
+	require.True(t, openAIStreamFailedEventShouldFailover(overloaded, "Please retry later."))
+	require.Equal(t, http.StatusBadGateway, openAIStreamFailedEventSemanticStatus(overloaded, "Please retry later."))
+}
+
+func TestExtractCodexFinalResponseIncludesIncomplete(t *testing.T) {
+	body := "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n"
+	final, ok := extractCodexFinalResponse(body)
+	require.True(t, ok)
+	require.Equal(t, "resp_incomplete", gjson.GetBytes(final, "id").String())
+	require.Equal(t, "incomplete", gjson.GetBytes(final, "status").String())
 }
 
 func TestOpenAIStreamingResponseFailedAfterOutputSanitizesVerboseResponseForClient(t *testing.T) {

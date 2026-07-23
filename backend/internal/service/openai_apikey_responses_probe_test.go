@@ -11,6 +11,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
 )
 
 func TestProbeOpenAIAPIKeyResponsesSupportUsesCodexProbeHeaders(t *testing.T) {
@@ -117,4 +118,22 @@ func TestSelectResponsesProbeModel(t *testing.T) {
 		"model_mapping": map[string]any{"a": "gpt-*"},
 	}}
 	require.Equal(t, openai.DefaultTestModel, selectResponsesProbeModel(acctAllWild))
+}
+
+func TestPrepareOpenAIResponsesProbeBodyUsesCodexInstallationIdentity(t *testing.T) {
+	account := &Account{
+		Platform: PlatformOpenAI,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"base_url": "https://new.sharedchat.cc/codex/responses",
+		},
+		Extra: map[string]any{
+			"openai_device_id": "3f4c0e42-73d5-4ca4-9568-48f9ab8265ad",
+		},
+	}
+
+	body, err := prepareOpenAIResponsesProbeBody(account, "gpt-5.6-sol")
+	require.NoError(t, err)
+	require.Equal(t, "3f4c0e42-73d5-4ca4-9568-48f9ab8265ad", gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String())
+	require.False(t, gjson.GetBytes(body, "stream").Bool(), "capability probe remains a unary response check")
 }

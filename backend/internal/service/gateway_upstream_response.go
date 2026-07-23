@@ -297,6 +297,10 @@ func extractUpstreamErrorMessage(body []byte) string {
 		}
 		return m
 	}
+	// xAI CLI style: {"code":"invalid-argument","error":"..."}
+	if e := gjson.GetBytes(body, "error"); e.Type == gjson.String && strings.TrimSpace(e.String()) != "" {
+		return e.String()
+	}
 
 	// ChatGPT 内部 API 风格：{"detail":"..."}
 	if d := gjson.GetBytes(body, "detail").String(); strings.TrimSpace(d) != "" {

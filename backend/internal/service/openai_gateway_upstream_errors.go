@@ -177,6 +177,13 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 			return true
 		}
 		hasExceeded := strings.Contains(lower, "exceed") || strings.Contains(lower, "too large") || strings.Contains(lower, "too long")
+		hasMaximumPromptLength := strings.Contains(lower, "maximum prompt length") || strings.Contains(lower, "max prompt length")
+		if hasMaximumPromptLength && strings.Contains(lower, "request contains") && strings.Contains(lower, "token") {
+			return true
+		}
+		if strings.Contains(lower, "prompt length") && hasExceeded {
+			return true
+		}
 		if strings.Contains(lower, "context window") && hasExceeded {
 			return true
 		}
@@ -209,6 +216,122 @@ func isOpenAIContextWindowError(upstreamMsg string, upstreamBody []byte) bool {
 	return match(string(upstreamBody))
 }
 
+func openAIUpstreamFailureValues(upstreamBody []byte, paths ...string) []string {
+	values := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(upstreamBody, path).String())); value != "" {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+func openAIUpstreamFailureHasExact(values []string, expected ...string) bool {
+	for _, value := range values {
+		for _, candidate := range expected {
+			if value == candidate {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func openAIUpstreamFailureMessageText(upstreamMsg string, upstreamBody []byte) string {
+	parts := []string{strings.ToLower(strings.TrimSpace(upstreamMsg))}
+	parts = append(parts, openAIUpstreamFailureValues(
+		upstreamBody,
+		"error.message",
+		"response.error.message",
+		"message",
+	)...)
+	return strings.TrimSpace(strings.Join(parts, " "))
+}
+
+// isOpenAINonReplayableRequestFailure identifies deterministic request-level
+// failures that another account cannot fix.  Some compatible upstreams wrap
+// these errors in 5xx responses, so the HTTP status alone is not sufficient.
+func isOpenAINonReplayableRequestFailure(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
+		return true
+	}
+	if isOpenAITransientProcessingError(statusCode, upstreamMsg, upstreamBody) {
+		return false
+	}
+	codesAndTypes := openAIUpstreamFailureValues(
+		upstreamBody,
+		"error.code", "response.error.code", "code",
+		"error.type", "response.error.type", "type",
+	)
+	if openAIUpstreamFailureHasExact(codesAndTypes,
+		"content_policy", "content_policy_violation", "policy_violation",
+		"sensitive_words_detected", "safety_violation", "cyber_policy",
+		"request_not_allowed", "prompt_not_allowed", "high_risk_cyber",
+		"request_cancelled", "request_canceled", "cancelled", "canceled",
+	) {
+		return true
+	}
+	if statusCode == http.StatusBadRequest && openAIUpstreamFailureHasExact(
+		openAIUpstreamFailureValues(upstreamBody, "error.code", "response.error.code", "code"),
+		"invalid_request", "invalid_prompt", "invalid_parameter",
+		"missing_required_parameter", "unsupported_parameter", "unsupported_value",
+		"invalid_json", "invalid_type", "too_many_input_items",
+	) {
+		return true
+	}
+	message := openAIUpstreamFailureMessageText(upstreamMsg, upstreamBody)
+	for _, marker := range []string{
+		"violates our usage policies",
+		"blocked by content policy",
+		"content policy violation",
+		"sensitive words detected",
+		"high-risk cyber",
+		"high risk cyber",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// isOpenAINonRetryableSameAccountFailure identifies account/model failures
+// that may justify trying another account but cannot improve by immediately
+// replaying the same credentials.  This guard takes precedence over an
+// administrator's broad 5xx retry-status list.
+func isOpenAINonRetryableSameAccountFailure(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
+	if isOpenAITransientProcessingError(statusCode, upstreamMsg, upstreamBody) {
+		return false
+	}
+	switch statusCode {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		return true
+	}
+	codesAndTypes := openAIUpstreamFailureValues(
+		upstreamBody,
+		"error.code", "response.error.code", "code",
+		"error.type", "response.error.type", "type",
+	)
+	if openAIUpstreamFailureHasExact(codesAndTypes,
+		"model_not_found", "model_not_supported", "unsupported_model", "invalid_model",
+		"channel_not_found",
+		"invalid_api_key", "authentication_error", "permission_denied", "permission_error",
+		"insufficient_quota", "billing_hard_limit", "payment_required",
+	) {
+		return true
+	}
+	message := openAIUpstreamFailureMessageText(upstreamMsg, upstreamBody)
+	for _, marker := range []string{
+		"model not found", "model is not supported", "channel not found",
+		"invalid api key", "insufficient quota", "billing hard limit",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool {
 	switch statusCode {
 	case 401, 402, 403, 429, 529:
@@ -219,7 +342,7 @@ func (s *OpenAIGatewayService) shouldFailoverUpstreamError(statusCode int) bool 
 }
 
 func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
-	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
+	if isOpenAINonReplayableRequestFailure(statusCode, upstreamMsg, upstreamBody) {
 		return false
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, upstreamBody) {
@@ -253,6 +376,10 @@ func newOpenAIUpstreamFailoverError(
 		ResponseBody:           responseBody,
 		ResponseHeaders:        responseHeaders.Clone(),
 		RetryableOnSameAccount: retryableOnSameAccount,
+	}
+	if isOpenAINonReplayableRequestFailure(statusCode, upstreamMsg, responseBody) ||
+		isOpenAINonRetryableSameAccountFailure(statusCode, upstreamMsg, responseBody) {
+		failoverErr.RetryableOnSameAccount = false
 	}
 	if isOpenAIRequestBodyTooLargeError(statusCode, upstreamMsg, responseBody) {
 		failoverErr.RetryableOnSameAccount = false
@@ -463,7 +590,11 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		reqModel, _, _ = extractOpenAIRequestMetaFromBody(requestBody)
 		reqModel = canonicalOpenAIAccountSchedulingModel(account, reqModel)
 	}
-	shouldDisable := s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, body, reqModel)
+	contextWindowError := isOpenAIContextWindowError(upstreamMsg, body)
+	shouldDisable := false
+	if !contextWindowError {
+		shouldDisable = s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, body, reqModel)
+	}
 	kind := "http_error"
 	if shouldDisable {
 		kind = "failover"
@@ -479,11 +610,13 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		Detail:             upstreamDetail,
 	})
 	if shouldDisable {
-		return nil, &UpstreamFailoverError{
-			StatusCode:             resp.StatusCode,
-			ResponseBody:           body,
-			RetryableOnSameAccount: false,
-		}
+		return nil, newOpenAIUpstreamFailoverError(
+			resp.StatusCode,
+			resp.Header,
+			body,
+			upstreamMsg,
+			account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+		)
 	}
 
 	MarkResponseCommitted(c)
@@ -514,16 +647,39 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		errType = "upstream_error"
 		errMsg = "Upstream request failed"
 	}
-	if isOpenAIContextWindowError(upstreamMsg, body) && upstreamMsg != "" {
+	if contextWindowError && upstreamMsg != "" {
 		errMsg = upstreamMsg
 	}
+	grokContextWindowError := account != nil &&
+		account.Platform == PlatformGrok &&
+		contextWindowError
+	if grokContextWindowError {
+		statusCode = http.StatusBadRequest
+		errType = "invalid_request_error"
+		if upstreamMsg == "" {
+			upstreamMsg = "Request exceeds the model context length"
+		}
+		errMsg = upstreamMsg
+		if gjson.GetBytes(requestBody, "stream").Bool() {
+			header := c.Writer.Header()
+			header.Set("Content-Type", "text/event-stream")
+			header.Set("Cache-Control", "no-cache")
+			header.Set("Connection", "keep-alive")
+			header.Set("X-Accel-Buffering", "no")
+			c.Status(http.StatusOK)
+			writeOpenAICompactSSEFailureMessage(c, statusCode, "context_length_exceeded", errMsg)
+			return nil, fmt.Errorf("upstream error: %d message=%s", resp.StatusCode, upstreamMsg)
+		}
+	}
 
-	c.JSON(statusCode, gin.H{
-		"error": gin.H{
-			"type":    errType,
-			"message": errMsg,
-		},
-	})
+	errorPayload := gin.H{
+		"type":    errType,
+		"message": errMsg,
+	}
+	if grokContextWindowError {
+		errorPayload["code"] = "context_length_exceeded"
+	}
+	c.JSON(statusCode, gin.H{"error": errorPayload})
 
 	if upstreamMsg == "" {
 		return nil, fmt.Errorf("upstream error: %d", resp.StatusCode)
@@ -656,11 +812,13 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 		Detail:             upstreamDetail,
 	})
 	if shouldDisable {
-		return nil, &UpstreamFailoverError{
-			StatusCode:             resp.StatusCode,
-			ResponseBody:           body,
-			RetryableOnSameAccount: false,
-		}
+		return nil, newOpenAIUpstreamFailoverError(
+			resp.StatusCode,
+			resp.Header,
+			body,
+			upstreamMsg,
+			account.IsPoolMode() && account.IsPoolModeRetryableStatus(resp.StatusCode),
+		)
 	}
 
 	MarkResponseCommitted(c)

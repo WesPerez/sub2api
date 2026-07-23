@@ -14,7 +14,7 @@ import (
 // Keep this matcher deliberately narrow: account entitlement and suspension
 // messages may mention policy but must retain the normal account failover path.
 func isGrokContentPolicyRejection(statusCode int, responseBody []byte) bool {
-	if statusCode != http.StatusForbidden || len(responseBody) == 0 {
+	if statusCode < http.StatusBadRequest || len(responseBody) == 0 {
 		return false
 	}
 	if grokAccountAccessMessage(string(responseBody)) {
@@ -31,6 +31,9 @@ func isGrokContentPolicyRejection(statusCode int, responseBody []byte) bool {
 		}
 	}
 
+	if statusCode != http.StatusForbidden {
+		return false
+	}
 	return grokContentPolicyMessage(string(responseBody))
 }
 
@@ -98,7 +101,10 @@ func isGrokContentPolicyCode(value string) bool {
 		"content_policy_violation",
 		"content_moderation",
 		"cyber_policy",
-		"new_sensitive":
+		"new_sensitive",
+		"sensitive_words_detected",
+		"safety_violation",
+		"prompt_not_allowed":
 		return true
 	default:
 		return false

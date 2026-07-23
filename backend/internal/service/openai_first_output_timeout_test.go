@@ -542,6 +542,39 @@ func TestOpenAINativeFirstOutputScannerAllowsLargeEventAfterSemanticBoundary(t *
 	require.Equal(t, "request-large-image", rec.Result().Header.Get("X-Request-Id"))
 }
 
+func TestOpenAINativeFirstSemanticEventCanExceedPassthroughFrameCap(t *testing.T) {
+	cfg := &config.Config{Gateway: config.GatewayConfig{
+		OpenAIFirstOutputTimeoutSeconds: 30,
+		MaxLineSize:                     defaultMaxLineSize,
+	}}
+	svc := &OpenAIGatewayService{cfg: cfg, responseHeaderFilter: compileResponseHeaderFilter(cfg)}
+	largeDelta := strings.Repeat("n", openAIWireSSEFrameMaxBytes+32*1024)
+	body := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"` + largeDelta + `"}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_large_first","usage":{"input_tokens":2,"output_tokens":1}}}`,
+		"",
+	}, "\n")
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"X-Request-Id": []string{"request-large-first"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+
+	result, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotNil(t, result.firstTokenMs)
+	require.Equal(t, "resp_large_first", result.responseID)
+	require.Contains(t, rec.Body.String(), strings.Repeat("n", 1024))
+	require.Contains(t, rec.Body.String(), `"type":"response.completed"`)
+	require.Equal(t, "request-large-first", rec.Result().Header.Get("X-Request-Id"))
+}
+
 func TestOpenAINativeFirstOutputTimeoutDisabledPreservesKeepaliveFlush(t *testing.T) {
 	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
 		StreamKeepaliveInterval: 1,

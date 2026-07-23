@@ -25,6 +25,8 @@ import (
 
 func f64p(v float64) *float64 { return &v }
 
+const codexAPIKeyTestInstallationID = "550e8400-e29b-41d4-a716-446655440000"
+
 type httpUpstreamRecorder struct {
 	lastReq      *http.Request
 	lastBody     []byte
@@ -1129,7 +1131,7 @@ func TestOpenAIGatewayService_APIKeyPassthrough_RebuildsUpstreamErrors(t *testin
 			}
 			requestBody := []byte(`{"model":"gpt-5.2","stream":false,"input":"hello"}`)
 
-			_, err := svc.Forward(context.Background(), c, account, requestBody)
+			err := svc.handleErrorResponsePassthrough(context.Background(), upstream.resp, c, account, requestBody, []byte(tt.responseBody))
 
 			require.Error(t, err)
 			require.Equal(t, tt.wantStatus, rec.Code)
@@ -1451,6 +1453,40 @@ func TestOpenAIGatewayService_OpenAIPassthrough_RetryableStatusesTriggerFailover
 			tc.assertRepo(t, repo, start)
 		})
 	}
+}
+
+func TestOpenAIGatewayService_PassthroughUsesSharedAccountFailureClassifier(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	apiKeyAccount := &Account{Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
+	oauthAccount := &Account{Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	rateLimit403 := []byte(`{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","message":"rolling spend limit exceeded"}}`)
+
+	require.True(t, svc.shouldFailoverOpenAIPassthroughResponse(apiKeyAccount, http.StatusUnauthorized, []byte(`{"error":{"code":"invalid_api_key"}}`)))
+	require.True(t, svc.shouldFailoverOpenAIPassthroughResponse(apiKeyAccount, http.StatusPaymentRequired, []byte(`{"error":{"code":"payment_required"}}`)))
+	require.True(t, svc.shouldFailoverOpenAIPassthroughResponse(apiKeyAccount, http.StatusForbidden, rateLimit403))
+	require.False(t, svc.shouldFailoverOpenAIPassthroughResponse(oauthAccount, http.StatusUnauthorized, []byte(`{"error":{"code":"invalid_api_key"}}`)))
+	require.False(t, svc.shouldFailoverOpenAIPassthroughResponse(oauthAccount, http.StatusForbidden, rateLimit403))
+
+	require.False(t, svc.shouldFailoverOpenAIPassthroughResponse(
+		apiKeyAccount,
+		http.StatusForbidden,
+		[]byte(`{"error":{"code":"content_policy_violation","message":"blocked by content policy"}}`),
+	))
+	require.True(t, svc.shouldFailoverOpenAIPassthroughResponse(
+		apiKeyAccount,
+		http.StatusServiceUnavailable,
+		[]byte(`{"error":{"code":"model_not_found","message":"model not found"}}`),
+	), "model/account failures may switch accounts even when same-account retry is forbidden")
+	require.True(t, svc.shouldFailoverOpenAIPassthroughResponse(
+		apiKeyAccount,
+		http.StatusBadGateway,
+		[]byte(`{"error":{"code":"get_channel_failed","message":"channel temporarily unavailable"}}`),
+	))
+	require.False(t, svc.shouldFailoverOpenAIPassthroughResponse(
+		oauthAccount,
+		http.StatusBadGateway,
+		[]byte(`{"error":{"message":"bad gateway"}}`),
+	), "OAuth passthrough keeps its existing 5xx replay boundary")
 }
 
 func TestOpenAIGatewayService_APIKeyPassthrough_Transient5xxTriggersFailover(t *testing.T) {
@@ -2181,4 +2217,509 @@ func TestOpenAIGatewayService_OAuthPassthrough_AllowTimeoutHeadersWhenConfigured
 	require.NotNil(t, upstream.lastReq)
 	require.Equal(t, "120000", upstream.lastReq.Header.Get("x-stainless-timeout"))
 	require.Empty(t, upstream.lastReq.Header.Get("X-Test"))
+}
+
+func TestNormalizeOpenAICodexAPIKeyPassthroughBody(t *testing.T) {
+	account := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Credentials: map[string]any{"base_url": "https://new.sharedchat.cc/codex/responses"},
+		Extra: map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   codexAPIKeyTestInstallationID,
+		},
+	}
+	original := []byte(`{"model":"gpt-5.6-sol","stream":false,"input":"hi"}`)
+
+	normalized, changed, err := normalizeOpenAICodexAPIKeyPassthroughBody(original, account)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, codexAPIKeyTestInstallationID, gjson.GetBytes(normalized, "client_metadata.x-codex-installation-id").String())
+	require.Equal(t, "hi", gjson.GetBytes(normalized, "input").String())
+	require.False(t, gjson.GetBytes(normalized, "stream").Bool())
+
+	t.Run("client value takes precedence", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"x-codex-installation-id":"123e4567-e89b-42d3-a456-426614174000"}}`)
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(body, account)
+		require.NoError(t, gotErr)
+		require.False(t, gotChanged)
+		require.Equal(t, body, got)
+	})
+
+	t.Run("invalid account value is not injected", func(t *testing.T) {
+		invalidAccount := *account
+		invalidAccount.Extra = map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   "not-a-uuid",
+		}
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(original, &invalidAccount)
+		require.EqualError(t, gotErr, "Codex API-key upstream requires a configured UUIDv4 installation identity")
+		var localErr *OpenAICodexPassthroughLocalError
+		require.ErrorAs(t, gotErr, &localErr)
+		require.Equal(t, http.StatusServiceUnavailable, localErr.StatusCode)
+		require.Equal(t, "configuration_error", localErr.ErrorType)
+		require.False(t, gotChanged)
+		require.Equal(t, original, got)
+	})
+
+	t.Run("non-object client metadata is rejected locally", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-sol","client_metadata":"opaque"}`)
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(body, account)
+		require.EqualError(t, gotErr, "client_metadata must be an object for Codex API-key passthrough")
+		var localErr *OpenAICodexPassthroughLocalError
+		require.ErrorAs(t, gotErr, &localErr)
+		require.Equal(t, http.StatusBadRequest, localErr.StatusCode)
+		require.Equal(t, "invalid_request_error", localErr.ErrorType)
+		require.False(t, gotChanged)
+		require.Equal(t, body, got)
+	})
+
+	t.Run("invalid client value is rejected locally", func(t *testing.T) {
+		body := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"x-codex-installation-id":"not-a-uuid"}}`)
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(body, account)
+		require.EqualError(t, gotErr, "client_metadata.x-codex-installation-id must be a UUIDv4")
+		require.False(t, gotChanged)
+		require.Equal(t, body, got)
+	})
+
+	t.Run("non-v4 and non-RFC variants are rejected", func(t *testing.T) {
+		for _, installationID := range []string{
+			"550e8400-e29b-11d4-a716-446655440000",
+			"550e8400-e29b-41d4-0716-446655440000",
+		} {
+			invalidAccount := *account
+			invalidAccount.Extra = map[string]any{
+				"openai_passthrough": true,
+				"openai_device_id":   installationID,
+			}
+			got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(original, &invalidAccount)
+			require.EqualError(t, gotErr, "Codex API-key upstream requires a configured UUIDv4 installation identity")
+			require.False(t, gotChanged)
+			require.Equal(t, original, got)
+		}
+	})
+
+	t.Run("account value is normalized", func(t *testing.T) {
+		upperAccount := *account
+		upperAccount.Extra = map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   strings.ToUpper(codexAPIKeyTestInstallationID),
+		}
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(original, &upperAccount)
+		require.NoError(t, gotErr)
+		require.True(t, gotChanged)
+		require.Equal(t, codexAPIKeyTestInstallationID, gjson.GetBytes(got, "client_metadata.x-codex-installation-id").String())
+	})
+
+	t.Run("ordinary API-key upstream is unchanged", func(t *testing.T) {
+		ordinaryAccount := *account
+		ordinaryAccount.Credentials = map[string]any{"base_url": "https://api.openai.com/v1/responses"}
+		got, gotChanged, gotErr := normalizeOpenAICodexAPIKeyPassthroughBody(original, &ordinaryAccount)
+		require.NoError(t, gotErr)
+		require.False(t, gotChanged)
+		require.Equal(t, original, got)
+	})
+}
+
+func TestNormalizeOpenAISharedChatMaxEffort(t *testing.T) {
+	account := &Account{
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Credentials: map[string]any{"base_url": "https://new.sharedchat.cc/codex/responses"},
+	}
+	body := []byte(`{"model":"gpt-5.6-sol","reasoning":{"effort":"max","summary":"auto","context":"all_turns"},"client_metadata":{"x-codex-installation-id":"123e4567-e89b-42d3-a456-426614174000","turn_id":"turn-1"}}`)
+
+	normalized, changed, err := normalizeOpenAISharedChatMaxEffort(body, account)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "xhigh", gjson.GetBytes(normalized, "reasoning.effort").String())
+	require.Equal(t, "auto", gjson.GetBytes(normalized, "reasoning.summary").String())
+	require.Equal(t, "all_turns", gjson.GetBytes(normalized, "reasoning.context").String())
+	require.Equal(t, "turn-1", gjson.GetBytes(normalized, "client_metadata.turn_id").String())
+
+	tests := []struct {
+		name       string
+		body       []byte
+		baseURL    string
+		wantEffort string
+	}{
+		{name: "already xhigh", body: []byte(`{"model":"gpt-5.6-sol","reasoning":{"effort":"xhigh"}}`), wantEffort: "xhigh"},
+		{name: "other effort", body: []byte(`{"model":"gpt-5.6-sol","reasoning":{"effort":"high"}}`), wantEffort: "high"},
+		{name: "flat max", body: []byte(`{"model":"gpt-5.6-sol","reasoning_effort":"max"}`), wantEffort: "max"},
+		{name: "other model", body: []byte(`{"model":"gpt-5.6-terra","reasoning":{"effort":"max"}}`), wantEffort: "max"},
+		{name: "other host", body: []byte(`{"model":"gpt-5.6-sol","reasoning":{"effort":"max"}}`), baseURL: "https://codex.example.com/codex/responses", wantEffort: "max"},
+		{name: "lookalike host", body: []byte(`{"model":"gpt-5.6-sol","reasoning":{"effort":"max"}}`), baseURL: "https://new.sharedchat.cc.evil/codex/responses", wantEffort: "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testAccount := *account
+			if tt.baseURL != "" {
+				testAccount.Credentials = map[string]any{"base_url": tt.baseURL}
+			}
+			got, gotChanged, gotErr := normalizeOpenAISharedChatMaxEffort(tt.body, &testAccount)
+			require.NoError(t, gotErr)
+			require.False(t, gotChanged)
+			actualEffort := gjson.GetBytes(got, "reasoning.effort").String()
+			if actualEffort == "" {
+				actualEffort = gjson.GetBytes(got, "reasoning_effort").String()
+			}
+			require.Equal(t, tt.wantEffort, actualEffort)
+		})
+	}
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_MissingInstallationRejectedBeforeUpstream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID:          455,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-api-key",
+			"base_url": "https://new.sharedchat.cc/codex/responses",
+		},
+		Extra:       map[string]any{"openai_passthrough": true},
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+
+	result, err := svc.Forward(
+		context.Background(),
+		c,
+		account,
+		[]byte(`{"model":"gpt-5.6-sol","stream":false,"input":"hi"}`),
+	)
+	require.Nil(t, result)
+	var localErr *OpenAICodexPassthroughLocalError
+	require.ErrorAs(t, err, &localErr)
+	require.Equal(t, http.StatusServiceUnavailable, localErr.StatusCode)
+	require.Equal(t, "configuration_error", localErr.ErrorType)
+	require.Nil(t, upstream.lastReq, "local configuration errors must not reach the upstream")
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_BridgesNonStreamingAndHonorsHeaderOverrides(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+	c.Request.Header.Set("User-Agent", "curl/8.0")
+	c.Request.Header.Set("Originator", "third_party")
+	c.Request.Header.Set("OpenAI-Beta", "legacy")
+	c.Request.Header.Set("Accept", "application/json")
+
+	originalBody := []byte(`{"model":"gpt-5.6-sol","stream":false,"reasoning":{"effort":"high"},"store":true,"input":[{"type":"input_text","text":"hi"}]}`)
+	upstreamSSE := strings.Join([]string{
+		`data: {"type":"response.completed","response":{"id":"resp_sharedchat_bridge","object":"response","model":"gpt-5.6-sol","status":"completed","output":[{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"OK"}]}],"usage":{"input_tokens":12,"output_tokens":2,"total_tokens":14}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	svc := &OpenAIGatewayService{
+		cfg:          &config.Config{Gateway: config.GatewayConfig{ForceCodexCLI: true}},
+		httpUpstream: upstream,
+	}
+	configuredUA := "codex_cli_rs/0.144.4 (Ubuntu 22.4.0; x86_64) xterm-256color"
+	account := &Account{
+		ID:          456,
+		Name:        "sharedchat-codex",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":                 "sk-api-key",
+			"base_url":                "https://new.sharedchat.cc/codex/responses",
+			"header_override_enabled": true,
+			"header_overrides": map[string]any{
+				"user-agent":  configuredUA,
+				"originator":  "codex_cli_rs",
+				"version":     "0.144.4",
+				"openai-beta": "responses=experimental",
+				"accept":      "text/event-stream",
+			},
+		},
+		Extra: map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   codexAPIKeyTestInstallationID,
+		},
+		Status:      StatusActive,
+		Schedulable: true,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, originalBody)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.False(t, result.Stream, "downstream contract must remain non-streaming")
+	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool(), "upstream request must use SSE")
+	require.Equal(t, "gpt-5.6-sol", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.Equal(t, codexAPIKeyTestInstallationID, gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
+	require.True(t, gjson.GetBytes(upstream.lastBody, "store").Bool())
+	require.Equal(t, "high", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
+	require.Equal(t, "https://new.sharedchat.cc/codex/responses", upstream.lastReq.URL.String())
+	require.Equal(t, configuredUA, getHeaderRaw(upstream.lastReq.Header, "user-agent"))
+	require.Equal(t, "codex_cli_rs", getHeaderRaw(upstream.lastReq.Header, "originator"))
+	require.Equal(t, "0.144.4", getHeaderRaw(upstream.lastReq.Header, "version"))
+	require.Equal(t, "responses=experimental", getHeaderRaw(upstream.lastReq.Header, "openai-beta"))
+	require.Equal(t, "text/event-stream", getHeaderRaw(upstream.lastReq.Header, "accept"))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+	require.Equal(t, "resp_sharedchat_bridge", gjson.Get(rec.Body.String(), "id").String())
+	require.Equal(t, "OK", gjson.Get(rec.Body.String(), "output.0.content.0.text").String())
+	require.NotContains(t, rec.Body.String(), "data:")
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_DowngradesSharedChatGPT56MaxEffort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, reqStream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", reqStream), func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+
+			upstreamSSE := strings.Join([]string{
+				`data: {"type":"response.completed","response":{"id":"resp_sharedchat_xhigh","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`,
+				"",
+				"data: [DONE]",
+				"",
+			}, "\n")
+			upstream := &httpUpstreamRecorder{resp: &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+			}}
+			svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+			account := &Account{
+				ID:          457,
+				Platform:    PlatformOpenAI,
+				Type:        AccountTypeAPIKey,
+				Concurrency: 1,
+				Credentials: map[string]any{
+					"api_key":  "sk-api-key",
+					"base_url": "https://new.sharedchat.cc/codex/responses",
+				},
+				Extra: map[string]any{
+					"openai_passthrough": true,
+					"openai_device_id":   codexAPIKeyTestInstallationID,
+				},
+				Status:      StatusActive,
+				Schedulable: true,
+			}
+
+			body := []byte(fmt.Sprintf(`{"model":"gpt-5.6-sol","stream":%t,"reasoning":{"effort":"max","summary":"auto"},"input":[{"type":"input_text","text":"hi"}]}`, reqStream))
+			result, err := svc.Forward(context.Background(), c, account, body)
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, reqStream, result.Stream)
+			require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+			require.Equal(t, "xhigh", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
+			require.Equal(t, "auto", gjson.GetBytes(upstream.lastBody, "reasoning.summary").String())
+			require.Equal(t, HTTPUpstreamProfileOpenAIHTTP1, HTTPUpstreamProfileFromContext(upstream.lastReq.Context()))
+			require.NotNil(t, result.ReasoningEffort)
+			require.Equal(t, "xhigh", *result.ReasoningEffort)
+			if reqStream {
+				require.Contains(t, rec.Body.String(), "response.completed")
+			} else {
+				require.Equal(t, "resp_sharedchat_xhigh", gjson.Get(rec.Body.String(), "id").String())
+			}
+		})
+	}
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_StreamingRequestRemainsStreaming(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+	originalBody := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"hi"}`)
+	upstreamSSE := strings.Join([]string{
+		`data: {"type":"response.completed","response":{"id":"resp_stream","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID: 457, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-api-key", "base_url": "https://new.sharedchat.cc/codex/responses"},
+		Extra: map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   codexAPIKeyTestInstallationID,
+		}, Status: StatusActive, Schedulable: true,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, originalBody)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.True(t, result.Stream)
+	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+	require.Equal(t, "hi", gjson.GetBytes(upstream.lastBody, "input").String())
+	require.Equal(t, codexAPIKeyTestInstallationID, gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
+	require.Contains(t, rec.Body.String(), "response.completed")
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_CompactRemainsUnary(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(nil))
+	originalBody := []byte(`{"model":"gpt-5.6-sol","stream":false,"reasoning":{"effort":"max"},"input":"hi"}`)
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"id":"resp_compact","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}`)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID: 458, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-api-key", "base_url": "https://new.sharedchat.cc/codex/responses"},
+		Extra: map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   codexAPIKeyTestInstallationID,
+		}, Status: StatusActive, Schedulable: true,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, originalBody)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, originalBody, upstream.lastBody)
+	require.False(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
+	require.Equal(t, "max", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
+	require.Equal(t, "https://new.sharedchat.cc/codex/responses/compact", upstream.lastReq.URL.String())
+}
+
+func TestOpenAIGatewayService_CodexAPIKeyPassthrough_RemoteCompactPreservesMaxEffort(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(nil))
+	c.Request.Header.Set("x-codex-beta-features", "remote_compaction_v2")
+	originalBody := []byte(`{"model":"gpt-5.6-sol","stream":true,"reasoning":{"effort":"max","context":"all_turns"},"input":[{"type":"compaction_trigger"}]}`)
+	upstreamSSE := strings.Join([]string{
+		`data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"summary"}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_remote_compact","status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamSSE)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID: 459, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1,
+		Credentials: map[string]any{"api_key": "sk-api-key", "base_url": "https://new.sharedchat.cc/codex/responses"},
+		Extra: map[string]any{
+			"openai_passthrough": true,
+			"openai_device_id":   codexAPIKeyTestInstallationID,
+		}, Status: StatusActive, Schedulable: true,
+	}
+
+	result, err := svc.Forward(context.Background(), c, account, originalBody)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "max", gjson.GetBytes(upstream.lastBody, "reasoning.effort").String())
+	require.Equal(t, "all_turns", gjson.GetBytes(upstream.lastBody, "reasoning.context").String())
+	require.Equal(t, "compaction_trigger", gjson.GetBytes(upstream.lastBody, "input.0.type").String())
+	require.Equal(t, "remote_compaction_v2", upstream.lastReq.Header.Get("x-codex-beta-features"))
+	require.Equal(t, "https://new.sharedchat.cc/codex/responses", upstream.lastReq.URL.String())
+	require.NotNil(t, result.ReasoningEffort)
+	require.Equal(t, "max", *result.ReasoningEffort)
+}
+
+func TestHandleNonStreamingResponsePassthrough_SSEProtocolOutcomes(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantStatus  int
+		wantError   bool
+		wantState   string
+	}{
+		{
+			name:        "completed with wrong content type",
+			contentType: "application/json",
+			body:        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_done\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\ndata: [DONE]\n\n",
+			wantStatus:  http.StatusOK,
+			wantState:   "completed",
+		},
+		{
+			name:        "incomplete is returned as responses json",
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_incomplete\",\"status\":\"incomplete\",\"output\":[],\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"usage\":{\"input_tokens\":2,\"output_tokens\":3}}}\n\n",
+			wantStatus:  http.StatusOK,
+			wantState:   "incomplete",
+		},
+		{
+			name:        "failed becomes json 502",
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_failed\",\"status\":\"failed\",\"error\":{\"message\":\"upstream rejected request\"}}}\n\n",
+			wantStatus:  http.StatusBadGateway,
+			wantError:   true,
+		},
+		{
+			name:        "truncated stream becomes json 502",
+			contentType: "text/event-stream",
+			body:        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_truncated\",\"status\":\"in_progress\"}}\n\ndata: [DONE]\n\n",
+			wantStatus:  http.StatusBadGateway,
+			wantError:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{tt.contentType}},
+				Body:       io.NopCloser(strings.NewReader(tt.body)),
+			}
+
+			result, err := (&OpenAIGatewayService{cfg: &config.Config{}}).handleNonStreamingResponsePassthrough(
+				context.Background(), resp, c, "gpt-5.6-sol", "",
+			)
+			if tt.wantError {
+				require.Error(t, err)
+				require.Nil(t, result)
+				require.Equal(t, tt.wantStatus, rec.Code)
+				require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+				require.Equal(t, "upstream_error", gjson.Get(rec.Body.String(), "error.type").String())
+				require.NotContains(t, rec.Body.String(), "data:")
+				return
+			}
+
+			require.NoError(t, err)
+			require.NotNil(t, result)
+			require.Equal(t, tt.wantStatus, rec.Code)
+			require.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+			require.Equal(t, tt.wantState, gjson.Get(rec.Body.String(), "status").String())
+			require.NotContains(t, rec.Body.String(), "data:")
+		})
+	}
 }

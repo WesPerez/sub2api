@@ -172,6 +172,29 @@ func (s *OpenAIGatewayService) BindStickySession(ctx context.Context, groupID *i
 	return s.setStickySessionAccountID(ctx, groupID, sessionHash, accountID, ttl)
 }
 
+// NewOpenAISameAccountRetrySelection keeps a retry on the account that
+// produced a retryable error without re-entering session scheduling.
+// The handler reacquires concurrency through the regular wait path, but does
+// not refresh or create a cross-request sticky binding for a failed attempt.
+// Most callers use this for pool-mode transient errors; image vacuum responses
+// deliberately use the same request-scoped retry for ordinary accounts too.
+func (s *OpenAIGatewayService) NewOpenAISameAccountRetrySelection(account *Account) *AccountSelectionResult {
+	if account == nil {
+		return nil
+	}
+	cfg := s.schedulingConfig()
+	return &AccountSelectionResult{
+		Account: account,
+		WaitPlan: &AccountWaitPlan{
+			AccountID:      account.ID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		},
+		SkipStickyBinding: true,
+	}
+}
+
 // SelectAccount selects an OpenAI account with sticky session support
 func (s *OpenAIGatewayService) SelectAccount(ctx context.Context, groupID *int64, sessionHash string) (*Account, error) {
 	return s.SelectAccountForModel(ctx, groupID, sessionHash, "")
@@ -939,13 +962,20 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 						}
 
 						waitingCount, _ := s.concurrencyService.GetAccountWaitingCount(ctx, accountID)
-						if waitingCount < cfg.StickySessionMaxWaiting {
+						if platform != PlatformGrok && waitingCount < cfg.StickySessionMaxWaiting {
 							return s.newSelectionResult(ctx, account, false, nil, &AccountWaitPlan{
 								AccountID:      accountID,
 								MaxConcurrency: account.Concurrency,
 								Timeout:        cfg.StickySessionWaitTimeout,
 								MaxWaiting:     cfg.StickySessionMaxWaiting,
 							})
+						}
+						if platform == PlatformGrok {
+							slog.Debug("grok.sticky_slot_busy_falling_back_to_pool",
+								"account_id", accountID,
+								"session", shortSessionHash(sessionHash),
+								"waiting_count", waitingCount,
+							)
 						}
 					}
 				}

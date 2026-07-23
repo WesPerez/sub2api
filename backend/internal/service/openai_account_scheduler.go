@@ -412,7 +412,7 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	}
 
 	if !req.StickyWeighted {
-		selection, escapedSticky, err := s.selectBySessionHash(ctx, req)
+		selection, escapedSticky, err := s.selectBySessionHash(ctx, &req)
 		if err != nil {
 			return nil, decision, err
 		}
@@ -436,6 +436,9 @@ func (s *defaultOpenAIAccountScheduler) Select(
 	if err != nil {
 		return nil, decision, err
 	}
+	if selection != nil {
+		selection.PreserveStickyBinding = req.PreserveStickyBinding
+	}
 	if selection != nil && selection.Account != nil {
 		decision.SelectedAccountID = selection.Account.ID
 		decision.SelectedAccountType = selection.Account.Type
@@ -453,8 +456,11 @@ func (s *defaultOpenAIAccountScheduler) Select(
 
 func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	ctx context.Context,
-	req OpenAIAccountScheduleRequest,
+	req *OpenAIAccountScheduleRequest,
 ) (*AccountSelectionResult, bool, error) {
+	if req == nil {
+		return nil, false, nil
+	}
 	sessionHash := strings.TrimSpace(req.SessionHash)
 	if sessionHash == "" || s == nil || s.service == nil || s.service.cache == nil {
 		return nil, false, nil
@@ -486,7 +492,7 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
 		return nil, false, nil
 	}
-	if !s.isAccountRequestCompatible(ctx, account, req) {
+	if !s.isAccountRequestCompatible(ctx, account, *req) {
 		return nil, false, nil
 	}
 	if !s.isAccountTransportCompatible(account, req.RequiredTransport) {
@@ -500,12 +506,19 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	}
 	escapeCfg := s.service.openAIStickyEscapeConfig()
 	if reason, errorRate, ttft, shouldEscape := s.shouldEscapeStickyAccount(accountID, escapeCfg); shouldEscape {
+		rebind := account.IsPoolMode()
 		slog.Info("sticky_escape_triggered",
 			"account_id", accountID,
 			"reason", reason,
 			"error_rate", errorRate,
 			"ttft", ttft,
+			"rebind", rebind,
 		)
+		excludeOpenAIAccountFromScheduleRequest(req, accountID)
+		if rebind {
+			_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+			return nil, false, nil
+		}
 		return nil, true, nil
 	}
 	result, acquireErr := s.service.tryAcquireAccountSlot(ctx, accountID, account.Concurrency)
@@ -522,13 +535,20 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
 	if s.service.concurrencyService != nil {
 		if escapeCfg.enabled && acquireErr == nil && result != nil && !result.Acquired {
+			rebind := account.IsPoolMode()
 			errorRate, ttft, _ := s.stats.snapshot(accountID)
 			slog.Info("sticky_escape_triggered",
 				"account_id", accountID,
 				"reason", "concurrency_full",
 				"error_rate", errorRate,
 				"ttft", ttft,
+				"rebind", rebind,
 			)
+			excludeOpenAIAccountFromScheduleRequest(req, accountID)
+			if rebind {
+				_ = s.service.deleteStickySessionAccountID(ctx, req.GroupID, sessionHash)
+				return nil, false, nil
+			}
 			return nil, true, nil
 		}
 		return &AccountSelectionResult{
@@ -542,6 +562,18 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 		}, false, nil
 	}
 	return nil, false, nil
+}
+
+func excludeOpenAIAccountFromScheduleRequest(req *OpenAIAccountScheduleRequest, accountID int64) {
+	if req == nil || accountID <= 0 {
+		return
+	}
+	excludedIDs := cloneExcludedAccountIDs(req.ExcludedIDs)
+	if excludedIDs == nil {
+		excludedIDs = make(map[int64]struct{})
+	}
+	excludedIDs[accountID] = struct{}{}
+	req.ExcludedIDs = excludedIDs
 }
 
 func openAIStickyAccountMatchesGroup(account *Account, groupID *int64) bool {
