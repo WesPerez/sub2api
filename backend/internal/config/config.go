@@ -950,6 +950,10 @@ type GatewayConfig struct {
 
 	// StreamDataIntervalTimeout: 流数据间隔超时（秒），0表示禁用
 	StreamDataIntervalTimeout int `mapstructure:"stream_data_interval_timeout"`
+	// GrokStreamMaxWallSeconds: Grok HTTP Responses 流式绝对时长上限（秒），0表示禁用。
+	GrokStreamMaxWallSeconds int `mapstructure:"grok_stream_max_wall_seconds"`
+	// GrokStreamClientDisconnectGraceSeconds: Grok 流式客户端断开后继续读取上游的宽限期（秒），0表示禁用强制取消。
+	GrokStreamClientDisconnectGraceSeconds int `mapstructure:"grok_stream_client_disconnect_grace_seconds"`
 	// StreamKeepaliveInterval: 流式 keepalive 间隔（秒），0表示禁用
 	StreamKeepaliveInterval int `mapstructure:"stream_keepalive_interval"`
 	// ImageStreamDataIntervalTimeout: 图片流数据间隔超时（秒），0表示禁用
@@ -2276,6 +2280,8 @@ func setDefaults() {
 	viper.SetDefault("gateway.client_idle_ttl_seconds", 900)
 	viper.SetDefault("gateway.concurrency_slot_ttl_minutes", 30) // 并发槽位过期时间（支持超长请求）
 	viper.SetDefault("gateway.stream_data_interval_timeout", 180)
+	viper.SetDefault("gateway.grok_stream_max_wall_seconds", 0)
+	viper.SetDefault("gateway.grok_stream_client_disconnect_grace_seconds", 0)
 	viper.SetDefault("gateway.stream_keepalive_interval", 10)
 	viper.SetDefault("gateway.image_stream_data_interval_timeout", 900)
 	viper.SetDefault("gateway.image_stream_keepalive_interval", 10)
@@ -3092,6 +3098,20 @@ func (c *Config) Validate() error {
 	if c.Gateway.StreamDataIntervalTimeout != 0 &&
 		(c.Gateway.StreamDataIntervalTimeout < 30 || c.Gateway.StreamDataIntervalTimeout > 300) {
 		return fmt.Errorf("gateway.stream_data_interval_timeout must be 0 or between 30-300 seconds")
+	}
+	if c.Gateway.GrokStreamMaxWallSeconds < 0 {
+		return fmt.Errorf("gateway.grok_stream_max_wall_seconds must be non-negative")
+	}
+	if c.Gateway.GrokStreamMaxWallSeconds != 0 &&
+		(c.Gateway.GrokStreamMaxWallSeconds < 30 || c.Gateway.GrokStreamMaxWallSeconds > 7200) {
+		return fmt.Errorf("gateway.grok_stream_max_wall_seconds must be 0 or between 30-7200 seconds")
+	}
+	if c.Gateway.GrokStreamClientDisconnectGraceSeconds < 0 {
+		return fmt.Errorf("gateway.grok_stream_client_disconnect_grace_seconds must be non-negative")
+	}
+	if c.Gateway.GrokStreamClientDisconnectGraceSeconds != 0 &&
+		(c.Gateway.GrokStreamClientDisconnectGraceSeconds < 5 || c.Gateway.GrokStreamClientDisconnectGraceSeconds > 300) {
+		return fmt.Errorf("gateway.grok_stream_client_disconnect_grace_seconds must be 0 or between 5-300 seconds")
 	}
 	if c.Gateway.StreamKeepaliveInterval < 0 {
 		return fmt.Errorf("gateway.stream_keepalive_interval must be non-negative")

@@ -441,9 +441,12 @@ func generateChatCmplID() string {
 // ---------------------------------------------------------------------------
 
 type bufferedFuncCall struct {
+	ID     string
+	Type   string
+	Status string
 	CallID string
 	Name   string
-	Args   strings.Builder
+	Args   string
 }
 
 // BufferedResponseAccumulator collects content from Responses SSE delta events
@@ -472,20 +475,39 @@ func (a *BufferedResponseAccumulator) ProcessEvent(event *ResponsesStreamEvent) 
 		if event.Delta != "" {
 			_, _ = a.text.WriteString(event.Delta)
 		}
-	case "response.output_item.added":
+	case "response.output_item.added", "response.output_item.done":
 		if event.Item != nil && (event.Item.Type == "function_call" || event.Item.Type == "custom_tool_call") {
-			idx := len(a.funcCalls)
-			a.outputIndexToFuncIdx[event.OutputIndex] = idx
-			a.funcCalls = append(a.funcCalls, bufferedFuncCall{
-				CallID: event.Item.CallID,
-				Name:   event.Item.Name,
-			})
+			idx, ok := a.outputIndexToFuncIdx[event.OutputIndex]
+			if !ok {
+				idx = len(a.funcCalls)
+				a.outputIndexToFuncIdx[event.OutputIndex] = idx
+				a.funcCalls = append(a.funcCalls, bufferedFuncCall{})
+			}
+			call := &a.funcCalls[idx]
+			call.ID = event.Item.ID
+			call.Type = event.Item.Type
+			call.Status = event.Item.Status
+			call.CallID = event.Item.CallID
+			call.Name = event.Item.Name
+			if event.Item.Type == "custom_tool_call" {
+				call.Args = event.Item.Input
+			} else if event.Item.Arguments != "" || event.Type == "response.output_item.done" {
+				call.Args = event.Item.Arguments
+			}
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		if event.Delta != "" {
 			if idx, ok := a.outputIndexToFuncIdx[event.OutputIndex]; ok {
-				_, _ = a.funcCalls[idx].Args.WriteString(event.Delta)
+				a.funcCalls[idx].Args += event.Delta
 			}
+		}
+	case "response.function_call_arguments.done":
+		if idx, ok := a.outputIndexToFuncIdx[event.OutputIndex]; ok {
+			a.funcCalls[idx].Args = event.Arguments
+		}
+	case "response.custom_tool_call_input.done":
+		if idx, ok := a.outputIndexToFuncIdx[event.OutputIndex]; ok {
+			a.funcCalls[idx].Args = event.Input
 		}
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if event.Delta != "" {
@@ -527,12 +549,20 @@ func (a *BufferedResponseAccumulator) BuildOutput() []ResponsesOutput {
 	}
 
 	for i := range a.funcCalls {
-		out = append(out, ResponsesOutput{
-			Type:      "function_call",
-			CallID:    a.funcCalls[i].CallID,
-			Name:      a.funcCalls[i].Name,
-			Arguments: a.funcCalls[i].Args.String(),
-		})
+		item := ResponsesOutput{
+			ID:     a.funcCalls[i].ID,
+			Type:   a.funcCalls[i].Type,
+			Status: a.funcCalls[i].Status,
+			CallID: a.funcCalls[i].CallID,
+			Name:   a.funcCalls[i].Name,
+		}
+		if item.Type == "custom_tool_call" {
+			item.Input = a.funcCalls[i].Args
+		} else {
+			item.Type = "function_call"
+			item.Arguments = a.funcCalls[i].Args
+		}
+		out = append(out, item)
 	}
 
 	return out

@@ -25,6 +25,7 @@ const (
 	grokUpstreamUserAgent                  = "sub2api-grok/1.0"
 	grokCLIVersion                         = "0.2.93"
 	grokDefaultResponsesModel              = "grok-4.5"
+	grokFreeUsageRollingWindowCooldown     = 24 * time.Hour
 	grokRateLimitFallbackCooldown          = 2 * time.Minute
 	grokRateLimitRepeatCooldown            = 10 * time.Minute
 	grokRateLimitSustainedCooldown         = 30 * time.Minute
@@ -178,6 +179,8 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 	var usage *OpenAIUsage
 	var firstTokenMs *int
 	responseID := ""
+	clientDisconnect := false
+	var streamErr error
 	if reqStream {
 		if hasGrokResponsesClientToolMapping(clientToolMapping) {
 			maxLineSize := defaultMaxLineSize
@@ -187,12 +190,16 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 			resp.Body = newGrokResponsesClientToolStreamBody(resp.Body, clientToolMapping, maxLineSize)
 		}
 		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
-		if err != nil {
+		streamErr = err
+		if streamResult != nil {
+			usage = streamResult.usage
+			firstTokenMs = streamResult.firstTokenMs
+			responseID = strings.TrimSpace(streamResult.responseID)
+			clientDisconnect = streamResult.clientDisconnect
+		}
+		if err != nil && !isGrokStreamPartialUsageError(err) {
 			return nil, err
 		}
-		usage = streamResult.usage
-		firstTokenMs = streamResult.firstTokenMs
-		responseID = strings.TrimSpace(streamResult.responseID)
 	} else {
 		nonStreamResult, err := s.handleNonStreamingResponse(ctx, resp, c, account, originalModel, upstreamModel)
 		if err != nil {
@@ -206,19 +213,28 @@ func (s *OpenAIGatewayService) forwardGrokResponses(
 		usage = &OpenAIUsage{}
 	}
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(patchedBody, originalModel)
-	return &OpenAIForwardResult{
-		RequestID:       firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
-		ResponseID:      responseID,
-		Usage:           *usage,
-		Model:           originalModel,
-		UpstreamModel:   upstreamModel,
-		ReasoningEffort: reasoningEffort,
-		Stream:          reqStream,
-		OpenAIWSMode:    false,
-		ResponseHeaders: resp.Header.Clone(),
-		Duration:        time.Since(startTime),
-		FirstTokenMs:    firstTokenMs,
-	}, nil
+	result := &OpenAIForwardResult{
+		RequestID:        firstNonEmpty(resp.Header.Get("x-request-id"), resp.Header.Get("xai-request-id")),
+		ResponseID:       responseID,
+		Usage:            *usage,
+		Model:            originalModel,
+		UpstreamModel:    upstreamModel,
+		ReasoningEffort:  reasoningEffort,
+		Stream:           reqStream,
+		OpenAIWSMode:     false,
+		ResponseHeaders:  resp.Header.Clone(),
+		Duration:         time.Since(startTime),
+		FirstTokenMs:     firstTokenMs,
+		ClientDisconnect: clientDisconnect,
+	}
+	if streamErr != nil {
+		return result, streamErr
+	}
+	return result, nil
+}
+
+func isGrokStreamPartialUsageError(err error) bool {
+	return IsGrokStreamControlledCutoff(err)
 }
 
 func isGrokInvalidEncryptedContentResponse(statusCode int, body []byte) bool {
@@ -664,6 +680,9 @@ var grokResponsesSupportedToolTypes = map[string]struct{}{
 func sanitizeGrokResponsesTools(body []byte) ([]byte, error) {
 	tools := gjson.GetBytes(body, "tools")
 	if !tools.Exists() || !tools.IsArray() {
+		if gjson.GetBytes(body, "tool_choice").Exists() {
+			return sjson.DeleteBytes(body, "tool_choice")
+		}
 		return body, nil
 	}
 
@@ -749,7 +768,12 @@ func shouldDropGrokToolChoice(toolChoice gjson.Result, tools []json.RawMessage) 
 		}
 		return true
 	}
-	return false
+	for _, tool := range tools {
+		if strings.TrimSpace(gjson.GetBytes(tool, "type").String()) == choiceType {
+			return false
+		}
+	}
+	return true
 }
 
 func (s *OpenAIGatewayService) bridgeGrokComposerImageInputs(
@@ -1349,7 +1373,7 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 		return
 	}
 	now := time.Now()
-	s.updateGrokUsageSnapshot(ctx, account, parseGrokQuotaSnapshot(headers, statusCode, now))
+	s.updateGrokUsageSnapshot(ctx, account, grokQuotaSnapshotForResponse(headers, statusCode, responseBody, now))
 	switch statusCode {
 	case http.StatusUnauthorized:
 		s.tempUnscheduleGrok(ctx, account, 10*time.Minute, "grok credentials unauthorized")
@@ -1367,7 +1391,54 @@ func (s *OpenAIGatewayService) handleGrokAccountUpstreamError(ctx context.Contex
 			s.tempUnscheduleGrok(ctx, account, 2*time.Minute, "grok upstream temporary error")
 		}
 	}
-	_ = responseBody
+}
+
+func grokQuotaSnapshotForResponse(headers http.Header, statusCode int, responseBody []byte, now time.Time) *xai.QuotaSnapshot {
+	snapshot := parseGrokQuotaSnapshot(headers, statusCode, now)
+	if (statusCode == http.StatusPaymentRequired || statusCode == http.StatusTooManyRequests) &&
+		grokQuotaExhaustedResponse(responseBody) &&
+		!grokQuotaSnapshotHasExplicitReset(snapshot, now) {
+		retryAfter := int(grokFreeUsageRollingWindowCooldown / time.Second)
+		if snapshot == nil {
+			snapshot = &xai.QuotaSnapshot{StatusCode: statusCode}
+		}
+		snapshot.RetryAfterSeconds = &retryAfter
+		snapshot.UpdatedAt = now.UTC().Format(time.RFC3339)
+	}
+	return snapshot
+}
+
+func grokQuotaSnapshotHasExplicitReset(snapshot *xai.QuotaSnapshot, now time.Time) bool {
+	if snapshot == nil {
+		return false
+	}
+	if snapshot.RetryAfterSeconds != nil && *snapshot.RetryAfterSeconds > 0 {
+		return true
+	}
+	for _, window := range []*xai.QuotaWindow{snapshot.Requests, snapshot.Tokens} {
+		if window == nil {
+			continue
+		}
+		if window.ResetUnix != nil && time.Unix(*window.ResetUnix, 0).After(now) {
+			return true
+		}
+		if resetAt, err := time.Parse(time.RFC3339, strings.TrimSpace(window.ResetAt)); err == nil && resetAt.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func grokQuotaExhaustedResponse(responseBody []byte) bool {
+	message := strings.ToLower(string(responseBody))
+	if strings.Contains(message, "included free usage") &&
+		strings.Contains(message, "rolling 24-hour window") {
+		return true
+	}
+	return strings.Contains(message, "subscription:free-usage-exhausted") ||
+		strings.Contains(message, "personal-team-blocked:spending-limit") ||
+		strings.Contains(message, "run out of credits") ||
+		strings.Contains(message, "need a grok subscription")
 }
 
 func (s *OpenAIGatewayService) tempUnscheduleGrok(ctx context.Context, account *Account, cooldown time.Duration, reason string) {

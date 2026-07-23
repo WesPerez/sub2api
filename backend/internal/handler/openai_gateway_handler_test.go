@@ -98,6 +98,18 @@ func TestOpenAIHandleStreamingAwareError_JSONEscaping(t *testing.T) {
 	}
 }
 
+func TestIsControlledGrokStreamCutoff(t *testing.T) {
+	result := &service.OpenAIForwardResult{}
+	grok := &service.Account{Platform: service.PlatformGrok}
+	openai := &service.Account{Platform: service.PlatformOpenAI}
+	err := fmt.Errorf("wrapped: %w", service.ErrGrokStreamMaxWallExceeded)
+
+	require.True(t, isControlledGrokStreamCutoff(grok, result, err))
+	require.False(t, isControlledGrokStreamCutoff(openai, result, err))
+	require.False(t, isControlledGrokStreamCutoff(grok, nil, err))
+	require.False(t, isControlledGrokStreamCutoff(grok, result, errors.New("stream read error")))
+}
+
 func TestOpenAIHandleStreamingAwareErrorWithCode_EmitsStableClassification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	w := httptest.NewRecorder()
@@ -2868,6 +2880,22 @@ data: {"type":"response.failed","error":{"message":"This content was flagged"}}
 		reported := openAIForwardErrorAlreadyCommunicated(c, before, errors.New("stream read error: unexpected EOF"))
 
 		require.False(t, reported)
+	})
+
+	t.Run("controlled Grok cutoff is already communicated", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest(http.MethodPost, EndpointResponses, nil)
+		before := c.Writer.Size()
+		_, _ = c.Writer.WriteString("event: response.incomplete\ndata: {}\n\n")
+
+		reported := openAIForwardErrorAlreadyCommunicated(
+			c,
+			before,
+			fmt.Errorf("forward wrapper: %w", service.ErrGrokStreamMaxWallExceeded),
+		)
+
+		require.True(t, reported)
 	})
 
 	// H-2: cyber_policy 命中且响应已写出时，即便 err 前缀不在白名单（非流式 400 cyber

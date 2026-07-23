@@ -3040,3 +3040,66 @@ func TestIsGrokImageGenerationModel(t *testing.T) {
 		})
 	}
 }
+
+func TestPatchGrokResponsesBodyDropsOrphanToolChoiceWithoutTools(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"grok","input":"classify the supplied records","tool_choice":{"type":"function","name":"missing"}}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.False(t, gjson.GetBytes(patched, "tools").Exists())
+	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
+}
+
+func TestPatchGrokResponsesBodyDropsChoiceForMissingNativeToolType(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"grok","input":"summarize the search result","tools":[{"type":"web_search"}],"tool_choice":{"type":"shell"}}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "web_search", gjson.GetBytes(patched, "tools.0.type").String())
+	require.False(t, gjson.GetBytes(patched, "tool_choice").Exists())
+}
+
+func TestPatchGrokResponsesBodyKeepsDeclaredNativeToolChoice(t *testing.T) {
+	t.Parallel()
+
+	body := []byte(`{"model":"grok","input":"summarize the search result","tools":[{"type":"web_search"}],"tool_choice":{"type":"web_search"}}`)
+	patched, err := patchGrokResponsesBody(body, "grok-4.5")
+	require.NoError(t, err)
+	require.Equal(t, "web_search", gjson.GetBytes(patched, "tool_choice.type").String())
+}
+
+func TestGrokQuotaSnapshotForResponseUsesRollingWindowFallback(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	for _, statusCode := range []int{http.StatusPaymentRequired, http.StatusTooManyRequests} {
+		snapshot := grokQuotaSnapshotForResponse(
+			nil,
+			statusCode,
+			[]byte(`{"code":"personal-team-blocked:spending-limit","error":"You have run out of credits or need a Grok subscription."}`),
+			now,
+		)
+		require.NotNil(t, snapshot)
+		require.NotNil(t, snapshot.RetryAfterSeconds)
+		require.Equal(t, int(grokFreeUsageRollingWindowCooldown/time.Second), *snapshot.RetryAfterSeconds)
+		require.Equal(t, now.Format(time.RFC3339), snapshot.UpdatedAt)
+	}
+}
+
+func TestGrokQuotaSnapshotForResponsePreservesExplicitReset(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, time.July, 24, 0, 0, 0, 0, time.UTC)
+	headers := http.Header{"Retry-After": []string{"45"}}
+
+	snapshot := grokQuotaSnapshotForResponse(
+		headers,
+		http.StatusTooManyRequests,
+		[]byte(`{"error":"included free usage exhausted over a rolling 24-hour window"}`),
+		now,
+	)
+
+	require.NotNil(t, snapshot)
+	require.NotNil(t, snapshot.RetryAfterSeconds)
+	require.Equal(t, 45, *snapshot.RetryAfterSeconds)
+}

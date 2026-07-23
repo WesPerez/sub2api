@@ -434,6 +434,12 @@ gateway:
   # Stream data interval timeout (seconds), 0=disable
   # 流数据间隔超时（秒），0=禁用
   stream_data_interval_timeout: 180
+  # Grok HTTP Responses stream absolute wall-clock limit (seconds), 0=disable
+  # Grok HTTP Responses 流式绝对时长上限（秒），0=禁用
+  grok_stream_max_wall_seconds: 0
+  # Grace period after a Grok streaming client disconnects (seconds), 0=disable forced cancellation
+  # Grok 流式客户端断开后继续读取上游的宽限期（秒），0=禁用强制取消
+  grok_stream_client_disconnect_grace_seconds: 0
   # Stream keepalive interval (seconds), 0=disable
   # 流式 keepalive 间隔（秒），0=禁用
   stream_keepalive_interval: 10

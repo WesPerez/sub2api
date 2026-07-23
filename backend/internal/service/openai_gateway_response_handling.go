@@ -21,6 +21,18 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+// Controlled Grok stream cutoffs are gateway policy outcomes, not upstream
+// account failures. Typed errors let callers preserve partial usage without
+// entering failover or cooldown paths.
+var (
+	ErrGrokStreamMaxWallExceeded = errors.New("gateway stream incomplete: gateway_max_time")
+	ErrGrokStreamDisconnectGrace = errors.New("gateway stream incomplete after client disconnect grace")
+)
+
+func IsGrokStreamControlledCutoff(err error) bool {
+	return errors.Is(err, ErrGrokStreamMaxWallExceeded) || errors.Is(err, ErrGrokStreamDisconnectGrace)
+}
+
 // openaiStreamingResult streaming response result
 type openaiStreamingResult struct {
 	usage            *OpenAIUsage
@@ -28,6 +40,7 @@ type openaiStreamingResult struct {
 	responseID       string
 	imageCount       int
 	imageOutputSizes []string
+	clientDisconnect bool
 }
 
 type openaiNonStreamingResult struct {
@@ -185,6 +198,22 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		keepaliveCh = keepaliveTicker.C
 	}
 
+	// These limits apply only to Grok HTTP Responses streams. Token limits stay
+	// outside Sub2API; this bounds total stream lifetime and post-disconnect
+	// billing gaps. The existing streamInterval remains an independent upstream
+	// idle detector and may fire first when no bytes arrive for that interval.
+	grokWallLimit := time.Duration(0)
+	grokDisconnectGrace := time.Duration(0)
+	if account != nil && account.Platform == PlatformGrok && s.cfg != nil {
+		if s.cfg.Gateway.GrokStreamMaxWallSeconds > 0 {
+			grokWallLimit = time.Duration(s.cfg.Gateway.GrokStreamMaxWallSeconds) * time.Second
+		}
+		if s.cfg.Gateway.GrokStreamClientDisconnectGraceSeconds > 0 {
+			grokDisconnectGrace = time.Duration(s.cfg.Gateway.GrokStreamClientDisconnectGraceSeconds) * time.Second
+		}
+	}
+	forceAsyncStreamLoop := grokWallLimit > 0 || grokDisconnectGrace > 0
+
 	var firstOutputTimer *time.Timer
 	var firstOutputCh <-chan time.Time
 	if firstOutputTimeout > 0 {
@@ -219,6 +248,29 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	// 否则下游 SDK（例如 OpenCode）会因为类型校验失败而报错。
 	errorEventSent := false
 	clientDisconnected := false // 客户端断开后继续 drain 上游以收集 usage
+	var disconnectGraceTimer *time.Timer
+	var disconnectGraceCh <-chan time.Time
+	startDisconnectGrace := func() {
+		if account == nil || grokDisconnectGrace <= 0 || disconnectGraceTimer != nil {
+			return
+		}
+		disconnectGraceTimer = time.NewTimer(grokDisconnectGrace)
+		disconnectGraceCh = disconnectGraceTimer.C
+		logger.LegacyPrintf("service.openai_gateway", "Grok stream client disconnect grace started: account=%d model=%s grace=%s", account.ID, originalModel, grokDisconnectGrace)
+	}
+	defer func() {
+		if disconnectGraceTimer != nil {
+			disconnectGraceTimer.Stop()
+		}
+	}()
+	noteClientDisconnected := func(reason string) {
+		if clientDisconnected {
+			return
+		}
+		clientDisconnected = true
+		logger.LegacyPrintf("service.openai_gateway", "%s", reason)
+		startDisconnectGrace()
+	}
 	sawTerminalEvent := false
 	sawFailedEvent := false
 	failedMessage := ""
@@ -255,8 +307,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			_ = resp.Body.Close()
 			return
 		}
-		clientDisconnected = true
-		logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
+		noteClientDisconnected("Client disconnected during streaming, continuing to drain upstream for billing")
 	}
 	completeGuardedEvent := func(queueDrained bool) {
 		completedSemanticEvent := eventStartsClientOutput
@@ -268,8 +319,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 			if shouldFlush {
 				if err := flushBuffered(); err != nil {
-					clientDisconnected = true
-					logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming flush, continuing to drain upstream for billing")
+					noteClientDisconnected("Client disconnected during streaming flush, continuing to drain upstream for billing")
 				} else {
 					clientOutputStarted = true
 					lastDownstreamWriteAt = time.Now()
@@ -295,15 +345,15 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		errorEventSent = true
 		payload := `{"type":"error","sequence_number":0,"error":{"type":"upstream_error","message":` + strconv.Quote(reason) + `,"code":` + strconv.Quote(reason) + `}}`
 		if err := flushBuffered(); err != nil {
-			clientDisconnected = true
+			noteClientDisconnected("Client disconnected before a streaming error event")
 			return
 		}
 		if _, err := writePendingString("data: " + payload + "\n\n"); err != nil {
-			clientDisconnected = true
+			noteClientDisconnected("Client disconnected while writing a streaming error event")
 			return
 		}
 		if err := flushBuffered(); err != nil {
-			clientDisconnected = true
+			noteClientDisconnected("Client disconnected while flushing a streaming error event")
 			return
 		}
 		clientOutputStarted = true
@@ -321,7 +371,73 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			responseID:       responseID,
 			imageCount:       imageCounter.Count(),
 			imageOutputSizes: imageCounter.Sizes(),
+			clientDisconnect: clientDisconnected,
 		}
+	}
+	sendGrokGatewayMaxTimeIncomplete := func() {
+		if errorEventSent || clientDisconnected || sawTerminalEvent {
+			return
+		}
+		errorEventSent = true
+		sawTerminalEvent = true
+		id := strings.TrimSpace(responseID)
+		if id == "" {
+			id = "resp_gateway_max_time"
+		}
+		inTok, outTok, cachedTok := 0, 0, 0
+		if usage != nil {
+			inTok = usage.InputTokens
+			outTok = usage.OutputTokens
+			cachedTok = usage.CacheReadInputTokens
+		}
+		payloadBytes := []byte(fmt.Sprintf(
+			`{"type":"response.incomplete","response":{"id":%s,"object":"response","model":%s,"status":"incomplete","output":[],"incomplete_details":{"reason":"gateway_max_time"},"usage":{"input_tokens":%d,"output_tokens":%d,"total_tokens":%d,"input_tokens_details":{"cached_tokens":%d}}}}`,
+			strconv.Quote(id),
+			strconv.Quote(strings.TrimSpace(originalModel)),
+			inTok,
+			outTok,
+			inTok+outTok,
+			cachedTok,
+		))
+		if normalized, changed := normalizeResponsesStreamingTerminalOutput(payloadBytes, streamOutputAccumulator, streamImageOutputs); changed {
+			payloadBytes = normalized
+		}
+		payload := string(payloadBytes)
+		// The timer can fire between data and the blank line dispatching its SSE
+		// frame. Close that frame before appending the synthetic terminal event.
+		if eventInProgress {
+			if _, err := writePendingString("\n"); err != nil {
+				noteClientDisconnected("Client disconnected while closing a partial Grok SSE frame")
+				return
+			}
+			eventInProgress = false
+		}
+		applyAttemptResponseHeaders()
+		if err := flushBuffered(); err != nil {
+			noteClientDisconnected("Client disconnected before the Grok gateway_max_time terminal")
+			return
+		}
+		frame := "event: response.incomplete\ndata: " + payload + "\n\n"
+		if _, err := writePendingString(frame); err != nil {
+			noteClientDisconnected("Client disconnected while writing the Grok gateway_max_time terminal")
+			return
+		}
+		if err := flushBuffered(); err != nil {
+			noteClientDisconnected("Client disconnected while flushing the Grok gateway_max_time terminal")
+			return
+		}
+		clientOutputStarted = true
+		lastDownstreamWriteAt = time.Now()
+		MarkOpsStreamError(c, "incomplete", "gateway_max_time", http.StatusGatewayTimeout)
+		logger.LegacyPrintf(
+			"service.openai_gateway",
+			"Grok stream wall-clock cutoff: account=%d model=%s reason=gateway_max_time response_id=%s input_tokens=%d output_tokens=%d",
+			account.ID,
+			originalModel,
+			id,
+			inTok,
+			outTok,
+		)
 	}
 	newPreSemanticFailoverError := func(payload []byte, message string) *UpstreamFailoverError {
 		failoverErr := s.newOpenAIStreamFailoverError(c, account, false, upstreamRequestID, payload, message)
@@ -335,8 +451,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			return
 		}
 		if err := flushBuffered(); err != nil {
-			clientDisconnected = true
-			logger.LegacyPrintf("service.openai_gateway", "%s", disconnectMessage)
+			noteClientDisconnected(disconnectMessage)
 			return
 		}
 		clientOutputStarted = true
@@ -612,8 +727,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				eventInProgress = line != ""
 				if shouldFlush {
 					if err := flushBuffered(); err != nil {
-						clientDisconnected = true
-						logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming flush, continuing to drain upstream for billing")
+						noteClientDisconnected("Client disconnected during streaming flush, continuing to drain upstream for billing")
 					} else {
 						clientOutputStarted = true
 						lastDownstreamWriteAt = time.Now()
@@ -703,7 +817,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 
 	// 无超时/无 keepalive 的常见路径走同步扫描，减少 goroutine 与 channel 开销。
-	if streamInterval <= 0 && keepaliveInterval <= 0 && firstOutputTimeout <= 0 {
+	if streamInterval <= 0 && keepaliveInterval <= 0 && firstOutputTimeout <= 0 && !forceAsyncStreamLoop {
 		defer putSSEScannerBuf64K(scanBuf)
 		for documentScanner.Scan() {
 			processSSELine(documentScanner.Text(), true)
@@ -773,6 +887,22 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}(scanBuf)
 	defer close(done)
 
+	var wallTimer *time.Timer
+	var wallCh <-chan time.Time
+	if grokWallLimit > 0 {
+		remaining := time.Until(startTime.Add(grokWallLimit))
+		if remaining <= 0 {
+			remaining = time.Nanosecond
+		}
+		wallTimer = time.NewTimer(remaining)
+		wallCh = wallTimer.C
+		defer wallTimer.Stop()
+	}
+	var clientCtxDone <-chan struct{}
+	if forceAsyncStreamLoop && ctx != nil {
+		clientCtxDone = ctx.Done()
+	}
+
 	for {
 		select {
 		case ev, ok := <-events:
@@ -835,6 +965,45 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				firstOutputTimeout, "semantic_output", resp.Header,
 			)
 
+		case <-clientCtxDone:
+			noteClientDisconnected("Client request context done, continuing to drain upstream for billing")
+			clientCtxDone = nil
+
+		case <-disconnectGraceCh:
+			logger.LegacyPrintf(
+				"service.openai_gateway",
+				"Grok stream disconnect grace elapsed, canceling upstream: account=%d model=%s grace=%s",
+				account.ID,
+				originalModel,
+				grokDisconnectGrace,
+			)
+			_ = resp.Body.Close()
+			for ev := range events {
+				markEventProcessed(ev)
+			}
+			return resultWithUsage(), ErrGrokStreamDisconnectGrace
+
+		case <-wallCh:
+			logger.LegacyPrintf(
+				"service.openai_gateway",
+				"Grok stream wall-clock timeout: account=%d model=%s wall=%s",
+				account.ID,
+				originalModel,
+				grokWallLimit,
+			)
+			alreadyTerminal := sawTerminalEvent
+			if !clientDisconnected && !alreadyTerminal {
+				sendGrokGatewayMaxTimeIncomplete()
+			}
+			_ = resp.Body.Close()
+			for ev := range events {
+				markEventProcessed(ev)
+			}
+			if alreadyTerminal {
+				return finalizeStream()
+			}
+			return resultWithUsage(), ErrGrokStreamMaxWallExceeded
+
 		case <-keepaliveCh:
 			if clientDisconnected {
 				continue
@@ -851,8 +1020,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				// Bypass attempt-local buffered frames. The stable SSE headers may be
 				// committed here, but account headers remain private until semantic output.
 				if _, err := w.Write([]byte(":\n\n")); err != nil {
-					clientDisconnected = true
-					logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
+					noteClientDisconnected("Client disconnected during streaming, continuing to drain upstream for billing")
 					continue
 				}
 				flusher.Flush()
@@ -860,13 +1028,11 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				continue
 			}
 			if _, err := writePendingString(":\n\n"); err != nil {
-				clientDisconnected = true
-				logger.LegacyPrintf("service.openai_gateway", "Client disconnected during streaming, continuing to drain upstream for billing")
+				noteClientDisconnected("Client disconnected during streaming, continuing to drain upstream for billing")
 				continue
 			}
 			if err := flushBuffered(); err != nil {
-				clientDisconnected = true
-				logger.LegacyPrintf("service.openai_gateway", "Client disconnected during keepalive flush, continuing to drain upstream for billing")
+				noteClientDisconnected("Client disconnected during keepalive flush, continuing to drain upstream for billing")
 			} else {
 				lastDownstreamWriteAt = time.Now()
 			}

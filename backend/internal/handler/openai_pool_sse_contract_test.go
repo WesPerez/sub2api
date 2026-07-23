@@ -79,6 +79,24 @@ func TestOpenAIPoolAttemptAuditDoesNotLeakCredentials(t *testing.T) {
 	require.Equal(t, "scheduler_no_eligible_account", audit.ExhaustionReason)
 }
 
+func TestOpenAIPoolAttemptAuditClassifiesGrokControlledCutoff(t *testing.T) {
+	audit := &openAIPoolAttemptAudit{}
+	account := &service.Account{
+		ID:          9,
+		Platform:    service.PlatformGrok,
+		Type:        service.AccountTypeAPIKey,
+		Credentials: map[string]any{"pool_mode": true},
+	}
+
+	recordOpenAIPoolForwardAttempt(audit, account, 1, service.ErrGrokStreamMaxWallExceeded)
+
+	require.Len(t, audit.Attempts, 1)
+	require.Equal(t, "controlled_cutoff", audit.Attempts[0].Outcome)
+	require.Equal(t, http.StatusOK, audit.Attempts[0].Status)
+	require.Equal(t, "gateway_max_time", audit.Attempts[0].ErrorCode)
+	require.False(t, audit.Attempts[0].Retryable)
+}
+
 func TestSanitizeOpenAIFailureCode(t *testing.T) {
 	require.Equal(t, "rate_limit_exceeded", sanitizeOpenAIFailureCode("rate_limit_exceeded"))
 	require.Equal(t, "upstream_error", sanitizeOpenAIFailureCode("!!!"))

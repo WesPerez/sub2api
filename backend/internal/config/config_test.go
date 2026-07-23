@@ -1786,6 +1786,26 @@ func TestValidateConfigErrors(t *testing.T) {
 			wantErr: "gateway.stream_data_interval_timeout must be non-negative",
 		},
 		{
+			name:    "gateway grok stream max wall range",
+			mutate:  func(c *Config) { c.Gateway.GrokStreamMaxWallSeconds = 5 },
+			wantErr: "gateway.grok_stream_max_wall_seconds",
+		},
+		{
+			name:    "gateway grok stream max wall negative",
+			mutate:  func(c *Config) { c.Gateway.GrokStreamMaxWallSeconds = -1 },
+			wantErr: "gateway.grok_stream_max_wall_seconds must be non-negative",
+		},
+		{
+			name:    "gateway grok disconnect grace range",
+			mutate:  func(c *Config) { c.Gateway.GrokStreamClientDisconnectGraceSeconds = 1 },
+			wantErr: "gateway.grok_stream_client_disconnect_grace_seconds",
+		},
+		{
+			name:    "gateway grok disconnect grace negative",
+			mutate:  func(c *Config) { c.Gateway.GrokStreamClientDisconnectGraceSeconds = -1 },
+			wantErr: "gateway.grok_stream_client_disconnect_grace_seconds must be non-negative",
+		},
+		{
 			name:    "gateway image stream keepalive range",
 			mutate:  func(c *Config) { c.Gateway.ImageStreamKeepaliveInterval = 4 },
 			wantErr: "gateway.image_stream_keepalive_interval",

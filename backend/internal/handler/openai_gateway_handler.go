@@ -59,6 +59,14 @@ func openAIForwardSucceededForScheduling(result *service.OpenAIForwardResult) bo
 	return result.SucceededForScheduling()
 }
 
+func isControlledGrokStreamCutoff(account *service.Account, result *service.OpenAIForwardResult, err error) bool {
+	return err != nil &&
+		account != nil &&
+		account.Platform == service.PlatformGrok &&
+		result != nil &&
+		service.IsGrokStreamControlledCutoff(err)
+}
+
 func resolveOpenAIMessagesDispatchMappedModel(apiKey *service.APIKey, requestedModel string) string {
 	if apiKey == nil || apiKey.Group == nil {
 		return ""
@@ -546,6 +554,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return h.gatewayService.Forward(c.Request.Context(), c, account, forwardBody)
 		}()
 		recordOpenAIPoolForwardAttempt(poolAudit, account, sameAccountRetryCount[account.ID]+1, err)
+		controlledGrokStreamCutoff := isControlledGrokStreamCutoff(account, result, err)
 		cyberBlockKeyHTTP := ""
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockKeyHTTP = service.CyberSessionBlockKey(apiKey.ID, c, sessionHashBody)
@@ -559,8 +568,21 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			responseLatencyMs = forwardDurationMs - upstreamLatencyMs
 		}
 		service.SetOpsLatencyMs(c, service.OpsResponseLatencyMsKey, responseLatencyMs)
-		if err == nil && result != nil && result.FirstTokenMs != nil {
+		if (err == nil || controlledGrokStreamCutoff) && result != nil && result.FirstTokenMs != nil {
 			service.SetOpsLatencyMs(c, service.OpsTimeToFirstTokenMsKey, int64(*result.FirstTokenMs))
+		}
+		if controlledGrokStreamCutoff {
+			reqLog.Info("openai.forward_stream_incomplete",
+				zap.Int64("account_id", account.ID),
+				zap.Bool("client_disconnect", result.ClientDisconnect),
+				zap.Int("input_tokens", result.Usage.InputTokens),
+				zap.Int("output_tokens", result.Usage.OutputTokens),
+				zap.Error(err),
+			)
+			// The stream handler already emitted response.incomplete, or the client
+			// disconnected. Complete scheduling and partial-usage accounting below
+			// without entering failover/cooldown.
+			err = nil
 		}
 		if err != nil {
 			if localErr := h.handleOpenAICodexPassthroughLocalError(c, err, streamStarted); localErr != nil {
@@ -2374,7 +2396,7 @@ type poolAttempt struct {
 	AccountID int64  `json:"account_id"`
 	Attempt   int    `json:"attempt"`
 	Kind      string `json:"kind"`    // initial|same_account_retry
-	Outcome   string `json:"outcome"` // success|failure
+	Outcome   string `json:"outcome"` // success|failure|controlled_cutoff
 	Status    int    `json:"status,omitempty"`
 	ErrorCode string `json:"error_code,omitempty"`
 	Retryable bool   `json:"retryable_on_same_account,omitempty"`
@@ -2419,7 +2441,15 @@ func recordOpenAIPoolForwardAttempt(audit *openAIPoolAttemptAudit, account *serv
 	}
 	item := poolAttempt{AccountID: account.ID, Attempt: attempt, Kind: kind, Outcome: "success", Status: http.StatusOK}
 	var failoverErr *service.UpstreamFailoverError
-	if err != nil {
+	if service.IsGrokStreamControlledCutoff(err) {
+		item.Outcome = "controlled_cutoff"
+		switch {
+		case errors.Is(err, service.ErrGrokStreamMaxWallExceeded):
+			item.ErrorCode = "gateway_max_time"
+		case errors.Is(err, service.ErrGrokStreamDisconnectGrace):
+			item.ErrorCode = "client_disconnect_grace"
+		}
+	} else if err != nil {
 		item.Outcome = "failure"
 		item.Status = 0
 	}
@@ -2786,6 +2816,10 @@ func openAIForwardErrorAlreadyCommunicated(c *gin.Context, writerSizeBeforeForwa
 	// fallback —— 否则在已写出的完整响应尾部追加 SSE（responses 端点尾随
 	// response.failed、chat 端点尾随 event:error），污染响应体。Size 已变化证明响应确已写出。
 	if service.GetOpsCyberPolicy(c) != nil {
+		return true
+	}
+
+	if service.IsGrokStreamControlledCutoff(err) {
 		return true
 	}
 
