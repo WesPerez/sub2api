@@ -1,0 +1,38 @@
+name: Sync Main With Upstream
+
+on:
+  schedule:
+    # Daily at 03:17 Asia/Shanghai.
+    - cron: '17 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-main-with-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main from upstream/main
+    if: github.repository == 'WesPerez/sub2api'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure upstream
+        run: |
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git || git remote set-url upstream https://github.com/Wei-Shaw/sub2api.git
+
+      - name: Mirror upstream main
+        run: |
+          expected="$(git rev-parse origin/main)"
+          git fetch upstream main
+          git checkout main
+          git reset --hard upstream/main
+          git push origin HEAD:main --force-with-lease=refs/heads/main:"${expected}"

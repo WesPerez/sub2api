@@ -1,0 +1,441 @@
+name: Docker Branch Images
+
+# Builds and publishes debug-only GHCR images after CI.
+# Production mine tags are created only by promote-debug-image.yml (carbon-copy).
+
+on:
+  push:
+    branches:
+      - debug
+  workflow_dispatch:
+
+concurrency:
+  group: docker-branch-debug
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require debug branch
+        env:
+          CHECK_REF: ${{ github.ref }}
+          CHECK_REF_NAME: ${{ github.ref_name }}
+          CHECK_SHA: ${{ github.sha }}
+          CHECK_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "${CHECK_REF}" != "refs/heads/debug" ]; then
+            echo "::error::Docker Branch Images only runs on refs/heads/debug (got ${CHECK_REF} / event=${CHECK_EVENT_NAME})"
+            exit 1
+          fi
+          if [ "${CHECK_REF_NAME}" != "debug" ]; then
+            echo "::error::github.ref_name must be debug (got ${CHECK_REF_NAME})"
+            exit 1
+          fi
+          case "${CHECK_SHA}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+              ;;
+            *)
+              echo "::error::github.sha is not a 40-char lowercase hex SHA: ${CHECK_SHA}"
+              exit 1
+              ;;
+          esac
+          echo "Validated debug ref at ${CHECK_SHA}"
+
+  verify:
+    needs: validate
+    permissions:
+      contents: read
+    uses: ./.github/workflows/backend-ci.yml
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache-only docker build (no registry login or push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=docker-branch-debug-trusted
+          cache-to: type=gha,mode=max,scope=docker-branch-debug-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=debug
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      full_sha: ${{ steps.meta.outputs.full_sha }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
+      digest: ${{ steps.publish_sha.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          full_sha="${{ github.sha }}"
+          short_sha="${full_sha::12}"
+          image="ghcr.io/${owner}/sub2api"
+          {
+            echo "image=${image}"
+            echo "full_sha=${full_sha}"
+            echo "short_sha=${short_sha}"
+            echo "sha_tag=debug-sha-${full_sha}"
+            echo "compat_tag=debug-${short_sha}"
+            echo "float_tag=debug"
+            echo "source_url=https://github.com/${{ github.repository }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Inspect existing immutable debug-sha tag
+        id: existing
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          FULL_SHA: ${{ steps.meta.outputs.full_sha }}
+          SOURCE_URL: ${{ steps.meta.outputs.source_url }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${SHA_TAG}"
+          if ! docker buildx imagetools inspect "$REF" --format '{{json .}}' >/tmp/existing-inspect.json 2>/tmp/existing-inspect.err; then
+            if ! grep -Eqi 'not found|manifest unknown|name unknown' /tmp/existing-inspect.err; then
+              echo "::error::Could not safely determine whether immutable tag ${REF} exists"
+              cat /tmp/existing-inspect.err || true
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No existing ${REF}; will build and push."
+            exit 0
+          fi
+          DIGEST="$(python3 -c 'import json; print((json.load(open("/tmp/existing-inspect.json")).get("manifest") or {}).get("digest", ""))')"
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve digest for existing ${REF}"
+            exit 1
+          fi
+          require_label() {
+            local key="$1" want="$2"
+            local got
+            got="$(KEY="$key" python3 -c 'import json, os; data=json.load(open("/tmp/existing-inspect.json")); print((((data.get("image") or {}).get("config") or {}).get("Labels") or {}).get(os.environ["KEY"], ""))')"
+            if [ "${got}" != "${want}" ]; then
+              echo "::error::Existing ${REF} label ${key} mismatch: want=${want} got=${got:-<missing>}"
+              echo "Existing debug-sha tag provenance mismatch; refusing overwrite"
+              exit 1
+            fi
+          }
+          require_label 'org.opencontainers.image.revision' "${FULL_SHA}"
+          require_label 'org.opencontainers.image.ref.name' 'debug'
+          require_label 'org.opencontainers.image.source' "${SOURCE_URL}"
+          docker buildx imagetools inspect "$REF" --format '{{json .Provenance}}' > /tmp/existing-provenance.json
+          ATTEST_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/existing-inspect.json"))
+          manifests=(data.get("manifest") or {}).get("manifests") or []
+          atts=[e for e in manifests if (e.get("annotations") or {}).get("vnd.docker.reference.type")=="attestation-manifest"]
+          if len(atts)!=1:
+              raise SystemExit("expected exactly one attestation-manifest in existing index")
+          print(atts[0]["digest"])
+          ')"
+          docker buildx imagetools inspect "${IMAGE}@${ATTEST_DIGEST}" --raw > /tmp/existing-attestation.json
+          STATEMENT_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/existing-attestation.json"))
+          layers=[e for e in data.get("layers", []) if e.get("mediaType")=="application/vnd.in-toto+json" and (e.get("annotations") or {}).get("in-toto.io/predicate-type")=="https://slsa.dev/provenance/v1"]
+          if len(layers)!=1:
+              raise SystemExit("expected exactly one SLSA in-toto statement layer")
+          print(layers[0]["digest"])
+          ')"
+          REPO_PATH="${IMAGE#ghcr.io/}"
+          REGISTRY_TOKEN="$(curl -fsS --retry 3 --retry-all-errors --get \
+            --user "${GHCR_USER}:${GHCR_TOKEN}" \
+            --data-urlencode "service=ghcr.io" \
+            --data-urlencode "scope=repository:${REPO_PATH}:pull" \
+            https://ghcr.io/token | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("token") or data.get("access_token") or "")')"
+          [ -n "$REGISTRY_TOKEN" ] || { echo "::error::Could not obtain GHCR pull token"; exit 1; }
+          curl -fsS --location --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${REGISTRY_TOKEN}" \
+            "https://ghcr.io/v2/${REPO_PATH}/blobs/${STATEMENT_DIGEST}" \
+            > /tmp/existing-statement.json
+          python3 deploy/verify-image-provenance.py \
+            --provenance /tmp/existing-provenance.json \
+            --manifest /tmp/existing-inspect.json \
+            --image-digest "$DIGEST" \
+            --attestation /tmp/existing-attestation.json \
+            --statement /tmp/existing-statement.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --revision "$FULL_SHA" \
+            --workflow-name "Docker Branch Images" \
+            --workflow-path .github/workflows/docker-branch.yml \
+            --job publish \
+            --ref refs/heads/debug \
+            --server-url "$GITHUB_SERVER_URL" > /tmp/existing-builder.json
+          PUBLISHER_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/existing-builder.json"))["publisher_run_id"])')"
+          PUBLISHER_RUN_ATTEMPT="$(python3 -c 'import json; print(json.load(open("/tmp/existing-builder.json"))["publisher_run_attempt"])')"
+          {
+            echo "exists=true"
+            echo "digest=${DIGEST}"
+            echo "publisher_run_id=${PUBLISHER_RUN_ID}"
+            echo "publisher_run_attempt=${PUBLISHER_RUN_ATTEMPT}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Existing ${REF} has trusted SLSA provenance; recovery metadata may be reissued."
+
+      - name: Build and push immutable debug-sha tag
+        id: push_sha
+        if: steps.existing.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: false
+          tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.sha_tag }}
+          cache-from: |
+            type=gha,scope=docker-branch-debug-${{ github.sha }}
+            type=gha,scope=docker-branch-debug-trusted
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=debug
+
+      - name: Resolve published debug-sha digest
+        id: publish_sha
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          EXISTING: ${{ steps.existing.outputs.exists }}
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          PUSH_DIGEST: ${{ steps.push_sha.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [ "${EXISTING}" = "true" ]; then
+            DIGEST="${EXISTING_DIGEST}"
+          else
+            DIGEST="${PUSH_DIGEST:-}"
+          fi
+          if [[ ! "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid digest for ${IMAGE}:${SHA_TAG}: ${DIGEST}"
+            exit 1
+          fi
+          docker buildx imagetools inspect "${IMAGE}:${SHA_TAG}" --format '{{json .}}' > /tmp/published-inspect.json
+          REMOTE_DIGEST="$(python3 -c 'import json; print((json.load(open("/tmp/published-inspect.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${REMOTE_DIGEST}" != "${DIGEST}" ]; then
+            echo "::error::Remote ${SHA_TAG} digest ${REMOTE_DIGEST} != expected ${DIGEST}"
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${IMAGE}:${SHA_TAG} @ ${DIGEST}"
+
+      - name: Verify immutable image SLSA provenance
+        id: provenance
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          FULL_SHA: ${{ steps.meta.outputs.full_sha }}
+          EXISTING: ${{ steps.existing.outputs.exists }}
+          DIGEST: ${{ steps.publish_sha.outputs.digest }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${SHA_TAG}"
+          docker buildx imagetools inspect "$REF" --format '{{json .}}' > /tmp/published-inspect.json
+          docker buildx imagetools inspect "$REF" --format '{{json .Provenance}}' > /tmp/published-provenance.json
+          ATTEST_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/published-inspect.json"))
+          manifests=(data.get("manifest") or {}).get("manifests") or []
+          atts=[e for e in manifests if (e.get("annotations") or {}).get("vnd.docker.reference.type")=="attestation-manifest"]
+          if len(atts)!=1:
+              raise SystemExit("expected exactly one attestation-manifest in published index")
+          print(atts[0]["digest"])
+          ')"
+          docker buildx imagetools inspect "${IMAGE}@${ATTEST_DIGEST}" --raw > /tmp/published-attestation.json
+          STATEMENT_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/published-attestation.json"))
+          layers=[e for e in data.get("layers", []) if e.get("mediaType")=="application/vnd.in-toto+json" and (e.get("annotations") or {}).get("in-toto.io/predicate-type")=="https://slsa.dev/provenance/v1"]
+          if len(layers)!=1:
+              raise SystemExit("expected exactly one SLSA in-toto statement layer")
+          print(layers[0]["digest"])
+          ')"
+          REPO_PATH="${IMAGE#ghcr.io/}"
+          REGISTRY_TOKEN="$(curl -fsS --retry 3 --retry-all-errors --get \
+            --user "${GHCR_USER}:${GHCR_TOKEN}" \
+            --data-urlencode "service=ghcr.io" \
+            --data-urlencode "scope=repository:${REPO_PATH}:pull" \
+            https://ghcr.io/token | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("token") or data.get("access_token") or "")')"
+          [ -n "$REGISTRY_TOKEN" ] || { echo "::error::Could not obtain GHCR pull token"; exit 1; }
+          curl -fsS --location --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${REGISTRY_TOKEN}" \
+            "https://ghcr.io/v2/${REPO_PATH}/blobs/${STATEMENT_DIGEST}" \
+            > /tmp/published-statement.json
+          python3 deploy/verify-image-provenance.py \
+            --provenance /tmp/published-provenance.json \
+            --manifest /tmp/published-inspect.json \
+            --image-digest "$DIGEST" \
+            --attestation /tmp/published-attestation.json \
+            --statement /tmp/published-statement.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --revision "$FULL_SHA" \
+            --workflow-name "Docker Branch Images" \
+            --workflow-path .github/workflows/docker-branch.yml \
+            --job publish \
+            --ref refs/heads/debug \
+            --server-url "$GITHUB_SERVER_URL" > /tmp/published-builder.json
+          PUBLISHER_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/published-builder.json"))["publisher_run_id"])')"
+          PUBLISHER_RUN_ATTEMPT="$(python3 -c 'import json; print(json.load(open("/tmp/published-builder.json"))["publisher_run_attempt"])')"
+          if [ "${EXISTING}" != "true" ]; then
+            if [ "${PUBLISHER_RUN_ID}" != "${GITHUB_RUN_ID}" ] || [ "${PUBLISHER_RUN_ATTEMPT}" != "${GITHUB_RUN_ATTEMPT}" ]; then
+              echo "::error::New image provenance builder does not match this run/attempt"
+              exit 1
+            fi
+          fi
+          {
+            echo "publisher_run_id=${PUBLISHER_RUN_ID}"
+            echo "publisher_run_attempt=${PUBLISHER_RUN_ATTEMPT}"
+            echo "reused_existing=${EXISTING}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Promote verified candidate cache to trusted
+        if: steps.provenance.outputs.reused_existing != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: false
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=docker-branch-debug-${{ github.sha }}
+          cache-to: type=gha,mode=max,scope=docker-branch-debug-trusted
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.ref.name=debug
+
+      - name: Carbon-copy floating debug tags if origin/debug still at SHA
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          FULL_SHA: ${{ steps.meta.outputs.full_sha }}
+          COMPAT_TAG: ${{ steps.meta.outputs.compat_tag }}
+          FLOAT_TAG: ${{ steps.meta.outputs.float_tag }}
+          DIGEST: ${{ steps.publish_sha.outputs.digest }}
+        run: |
+          set -euo pipefail
+          git fetch origin debug
+          REMOTE_SHA="$(git rev-parse origin/debug)"
+          if [ "${REMOTE_SHA}" != "${FULL_SHA}" ]; then
+            echo "::warning::origin/debug is ${REMOTE_SHA}, not ${FULL_SHA}; skipping carbon-copy to ${COMPAT_TAG} and ${FLOAT_TAG}"
+            exit 0
+          fi
+
+          SRC="${IMAGE}@${DIGEST}"
+          for tag in "${COMPAT_TAG}" "${FLOAT_TAG}"; do
+            git fetch origin debug
+            REMOTE_SHA="$(git rev-parse origin/debug)"
+            if [ "${REMOTE_SHA}" != "${FULL_SHA}" ]; then
+              echo "::warning::origin/debug moved to ${REMOTE_SHA}; refusing to update ${tag}"
+              exit 0
+            fi
+            echo "Carbon-copy ${SRC} -> ${IMAGE}:${tag}"
+            docker buildx imagetools create --tag "${IMAGE}:${tag}" "${SRC}"
+            docker buildx imagetools inspect "${IMAGE}:${tag}" --format '{{json .}}' > /tmp/tag-inspect.json
+            GOT="$(python3 -c 'import json; print((json.load(open("/tmp/tag-inspect.json")).get("manifest") or {}).get("digest", ""))')"
+            if [ "${GOT}" != "${DIGEST}" ]; then
+              echo "::error::After write, ${IMAGE}:${tag} digest ${GOT} != ${DIGEST}"
+              exit 1
+            fi
+            echo "Verified ${IMAGE}:${tag} @ ${GOT}"
+          done
+
+          git fetch origin debug
+          REMOTE_SHA2="$(git rev-parse origin/debug)"
+          if [ "${REMOTE_SHA2}" != "${FULL_SHA}" ]; then
+            echo "::warning::origin/debug moved to ${REMOTE_SHA2} after floating tag write (immutable debug-sha remains ${DIGEST})"
+          fi
+
+      - name: Write debug-image.json metadata
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          FULL_SHA: ${{ steps.meta.outputs.full_sha }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          DIGEST: ${{ steps.publish_sha.outputs.digest }}
+          PUBLISHER_RUN_ID: ${{ steps.provenance.outputs.publisher_run_id }}
+          PUBLISHER_RUN_ATTEMPT: ${{ steps.provenance.outputs.publisher_run_attempt }}
+          REUSED_EXISTING: ${{ steps.provenance.outputs.reused_existing }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -c '
+          import json, os
+          payload = {
+              "schema_version": 1,
+              "source_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "revision": os.environ["FULL_SHA"],
+              "digest": os.environ["DIGEST"],
+              "immutable_tag": os.environ["SHA_TAG"],
+              "image": os.environ["IMAGE"],
+              "publisher_run_id": os.environ["PUBLISHER_RUN_ID"],
+              "publisher_run_attempt": os.environ["PUBLISHER_RUN_ATTEMPT"],
+              "reused_existing": os.environ["REUSED_EXISTING"] == "true",
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "actor": os.environ.get("GITHUB_ACTOR"),
+          }
+          with open("debug-image.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, sort_keys=True)
+              f.write("\n")
+          os.chmod("debug-image.json", 0o600)
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          '
+
+      - name: Upload debug-image-metadata artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: debug-image-metadata
+          path: debug-image.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true

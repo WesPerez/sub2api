@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    branches-ignore:
+      - mine
+      - debug
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -16,8 +20,12 @@ jobs:
         run: |
           /bin/bash -n deploy/apple-container.sh
           /bin/bash deploy/tests/apple-container-test.sh
+          /bin/bash -n deploy/tests/workflow-release-contract-test.sh
+          /bin/bash deploy/tests/workflow-release-contract-test.sh
+          /bin/bash -n deploy/tests/verify-image-provenance-test.sh
+          /bin/bash deploy/tests/verify-image-provenance-test.sh
 
-  test:
+  test-unit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -33,6 +41,20 @@ jobs:
       - name: Unit tests
         working-directory: backend
         run: make test-unit
+
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Verify Go version
+        run: |
+          go version | grep -q 'go1.26.5'
       - name: Integration tests
         working-directory: backend
         run: make test-integration

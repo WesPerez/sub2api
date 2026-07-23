@@ -1,0 +1,524 @@
+name: Promote Debug Image
+
+# Carbon-copy a verified debug-sha image onto mine tags. Does not build images.
+# Floating :mine is written last. Image config labels stay as produced on debug
+# (including org.opencontainers.image.ref.name=debug); this workflow never claims ref.name=mine.
+# The sealed evidence file remains local to the server. This workflow records
+# its operator-supplied hash; production apply re-hashes and validates the file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_revision:
+        description: '40-char lowercase git SHA that mine and debug must both equal'
+        required: true
+        type: string
+      source_digest:
+        description: 'Exact source image index/manifest digest (sha256:...)'
+        required: true
+        type: string
+      source_run_id:
+        description: 'GitHub Actions run id of Docker Branch Images that produced debug-sha'
+        required: true
+        type: string
+      verification_evidence_sha256:
+        description: 'Hash recorded here; production apply verifies the local sealed evidence file'
+        required: true
+        type: string
+
+concurrency:
+  group: promote-debug-image
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    steps:
+      - name: Checkout mine
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: mine
+
+      - name: Validate inputs and selected ref
+        id: input
+        env:
+          EXPECTED_REVISION: ${{ inputs.expected_revision }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EVIDENCE_SHA256: ${{ inputs.verification_evidence_sha256 }}
+          CHECK_REF: ${{ github.ref }}
+          CHECK_REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "${CHECK_REF}" != "refs/heads/mine" ] || [ "${CHECK_REF_NAME}" != "mine" ]; then
+            echo "::error::Promote workflow must be dispatched with selected ref mine"
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_REVISION}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::expected_revision must be 40 lowercase hex chars"
+            exit 1
+          fi
+          case "${EXPECTED_REVISION}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+              ;;
+            *)
+              echo "::error::expected_revision must be 40 lowercase hex chars"
+              exit 1
+              ;;
+          esac
+          if [[ ! "${SOURCE_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::source_digest must be sha256 plus exactly 64 lowercase hex chars"
+            exit 1
+          fi
+          if [[ ! "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::source_run_id must be numeric"
+            exit 1
+          fi
+          if [[ ! "${EVIDENCE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::verification_evidence_sha256 must be 64 lowercase hex chars"
+            exit 1
+          fi
+          case "${EVIDENCE_SHA256}" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+              ;;
+            *)
+              echo "::error::verification_evidence_sha256 must be 64 lowercase hex chars"
+              exit 1
+              ;;
+          esac
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          short_sha="${EXPECTED_REVISION::12}"
+          {
+            echo "image=ghcr.io/${owner}/sub2api"
+            echo "full_sha=${EXPECTED_REVISION}"
+            echo "short_sha=${short_sha}"
+            echo "source_tag=debug-sha-${EXPECTED_REVISION}"
+            echo "mine_sha_tag=mine-sha-${EXPECTED_REVISION}"
+            echo "mine_compat_tag=mine-${short_sha}"
+            echo "mine_float_tag=mine"
+            echo "source_url=https://github.com/${{ github.repository }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Remote head check #1 (mine and debug == expected_revision)
+        env:
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin mine debug
+          MINE_SHA="$(git rev-parse origin/mine)"
+          DEBUG_SHA="$(git rev-parse origin/debug)"
+          if [ "${MINE_SHA}" != "${FULL_SHA}" ]; then
+            echo "::error::origin/mine is ${MINE_SHA}, expected ${FULL_SHA}"
+            exit 1
+          fi
+          if [ "${DEBUG_SHA}" != "${FULL_SHA}" ]; then
+            echo "::error::origin/debug is ${DEBUG_SHA}, expected ${FULL_SHA}"
+            exit 1
+          fi
+          echo "Remote heads match ${FULL_SHA}"
+
+      - name: Validate source Docker Branch Images run
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}"
+          JSON="$(gh api "$API")"
+          printf '%s' "$JSON" | FULL_SHA="${FULL_SHA}" python3 -c '
+          import json, os, sys
+          data = json.load(sys.stdin)
+          want = os.environ["FULL_SHA"]
+          want_id = os.environ["SOURCE_RUN_ID"]
+          errs = []
+          if str(data.get("id")) != want_id:
+              errs.append("id=%r want %s" % (data.get("id"), want_id))
+          if data.get("status") != "completed":
+              errs.append("status=%r want completed" % (data.get("status"),))
+          if data.get("conclusion") != "success":
+              errs.append("conclusion=%r want success" % (data.get("conclusion"),))
+          if data.get("event") not in ("push", "workflow_dispatch"):
+              errs.append("event=%r want push or workflow_dispatch" % (data.get("event"),))
+          path = data.get("path") or ""
+          if path != ".github/workflows/docker-branch.yml":
+              errs.append("path=%r want .github/workflows/docker-branch.yml" % (path,))
+          if data.get("head_branch") != "debug":
+              errs.append("head_branch=%r want debug" % (data.get("head_branch"),))
+          if data.get("head_sha") != want:
+              errs.append("head_sha=%r want %s" % (data.get("head_sha"), want))
+          if errs:
+              print("::error::Source run validation failed:", file=sys.stderr)
+              for e in errs:
+                  print("  " + e, file=sys.stderr)
+              sys.exit(1)
+          print("Source run %s OK path=%s head_sha=%s" % (data.get("id"), path, data.get("head_sha")))
+          '
+
+      - name: Download debug-image-metadata from source run
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/debug-image-metadata
+          JSON="$(gh api "repos/${{ github.repository }}/actions/runs/${SOURCE_RUN_ID}/artifacts?per_page=100")"
+          printf '%s' "$JSON" | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          if int(data.get("total_count") or 0) > len(data.get("artifacts") or []):
+              print("::error::artifact list was truncated; uniqueness cannot be proven", file=sys.stderr)
+              sys.exit(1)
+          arts = [a for a in data.get("artifacts") or [] if a.get("name") == "debug-image-metadata"]
+          if len(arts) != 1:
+              print("::error::expected exactly one debug-image-metadata artifact, found %d" % len(arts), file=sys.stderr)
+              sys.exit(1)
+          a = arts[0]
+          if a.get("expired"):
+              print("::error::debug-image-metadata artifact is expired", file=sys.stderr)
+              sys.exit(1)
+          print(a["id"])
+          ' > /tmp/debug-meta-artifact-id
+          ART_ID="$(cat /tmp/debug-meta-artifact-id)"
+          gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/debug-image-metadata.zip
+          python3 -c '
+          import pathlib, stat, sys, zipfile
+          archive = zipfile.ZipFile("/tmp/debug-image-metadata.zip")
+          files = [entry for entry in archive.infolist() if not entry.is_dir()]
+          if len(files) != 1 or pathlib.PurePosixPath(files[0].filename).parts != ("debug-image.json",):
+              print("::error::debug-image-metadata must contain only debug-image.json", file=sys.stderr)
+              sys.exit(1)
+          if stat.S_ISLNK(files[0].external_attr >> 16):
+              print("::error::debug-image.json must not be a symlink", file=sys.stderr)
+              sys.exit(1)
+          pathlib.Path("/tmp/debug-image-metadata/debug-image.json").write_bytes(archive.read(files[0]))
+          '
+          if [ ! -f /tmp/debug-image-metadata/debug-image.json ]; then
+            echo "::error::debug-image.json missing inside debug-image-metadata artifact"
+            find /tmp/debug-image-metadata -type f -print || true
+            exit 1
+          fi
+          COUNT="$(find /tmp/debug-image-metadata -type f -name debug-image.json | wc -l | tr -d ' ')"
+          if [ "$COUNT" != "1" ]; then
+            echo "::error::expected exactly one debug-image.json in artifact, found $COUNT"
+            exit 1
+          fi
+
+      - name: Verify debug-image.json binds run/revision/digest/tag
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+          SOURCE_TAG: ${{ steps.input.outputs.source_tag }}
+          IMAGE: ${{ steps.input.outputs.image }}
+        run: |
+          set -euo pipefail
+          python3 -c '
+          import json, os, sys
+          with open("/tmp/debug-image-metadata/debug-image.json", encoding="utf-8") as f:
+              meta = json.load(f)
+          errs = []
+          if meta.get("schema_version") != 1:
+              errs.append("schema_version=%r want 1" % (meta.get("schema_version"),))
+          if str(meta.get("source_run_id")) != str(os.environ["SOURCE_RUN_ID"]):
+              errs.append("source_run_id meta=%r input=%r" % (meta.get("source_run_id"), os.environ["SOURCE_RUN_ID"]))
+          if meta.get("revision") != os.environ["FULL_SHA"]:
+              errs.append("revision meta=%r want=%r" % (meta.get("revision"), os.environ["FULL_SHA"]))
+          if meta.get("digest") != os.environ["SOURCE_DIGEST"]:
+              errs.append("digest meta=%r input=%r" % (meta.get("digest"), os.environ["SOURCE_DIGEST"]))
+          if meta.get("immutable_tag") != os.environ["SOURCE_TAG"]:
+              errs.append("immutable_tag meta=%r want=%r" % (meta.get("immutable_tag"), os.environ["SOURCE_TAG"]))
+          if meta.get("image") != os.environ["IMAGE"]:
+              errs.append("image meta=%r want=%r" % (meta.get("image"), os.environ["IMAGE"]))
+          if not str(meta.get("publisher_run_id", "")).isdigit():
+              errs.append("publisher_run_id missing/invalid")
+          if not str(meta.get("publisher_run_attempt", "")).isdigit():
+              errs.append("publisher_run_attempt missing/invalid")
+          if not isinstance(meta.get("reused_existing"), bool):
+              errs.append("reused_existing must be boolean")
+          if errs:
+              print("::error::debug-image.json does not bind source run to digest:", file=sys.stderr)
+              for e in errs:
+                  print("  " + e, file=sys.stderr)
+              print(json.dumps(meta, indent=2, sort_keys=True), file=sys.stderr)
+              sys.exit(1)
+          print("debug-image.json binds run/revision/digest/tag/image OK")
+          '
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify source debug-sha digest and labels
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          SOURCE_TAG: ${{ steps.input.outputs.source_tag }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+          SOURCE_URL: ${{ steps.input.outputs.source_url }}
+          GHCR_USER: ${{ github.repository_owner }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${SOURCE_TAG}"
+          docker buildx imagetools inspect "$REF" --format '{{json .}}' > /tmp/src-inspect.json
+          GOT="$(python3 -c 'import json; print((json.load(open("/tmp/src-inspect.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${GOT}" != "${SOURCE_DIGEST}" ]; then
+            echo "::error::${REF} digest ${GOT} != source_digest ${SOURCE_DIGEST}"
+            exit 1
+          fi
+          require_label() {
+            local key="$1" want="$2"
+            local got
+            got="$(KEY="$key" python3 -c 'import json, os; data=json.load(open("/tmp/src-inspect.json")); print((((data.get("image") or {}).get("config") or {}).get("Labels") or {}).get(os.environ["KEY"], ""))')"
+            if [ "${got}" != "${want}" ]; then
+              echo "::error::${REF} label ${key} mismatch: want=${want} got=${got:-<missing>}"
+              exit 1
+            fi
+          }
+          require_label 'org.opencontainers.image.revision' "${FULL_SHA}"
+          require_label 'org.opencontainers.image.ref.name' 'debug'
+          require_label 'org.opencontainers.image.source' "${SOURCE_URL}"
+          docker buildx imagetools inspect "$REF" --format '{{json .Provenance}}' > /tmp/src-provenance.json
+          ATTEST_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/src-inspect.json"))
+          manifests=(data.get("manifest") or {}).get("manifests") or []
+          atts=[e for e in manifests if (e.get("annotations") or {}).get("vnd.docker.reference.type")=="attestation-manifest"]
+          if len(atts)!=1:
+              raise SystemExit("expected exactly one attestation-manifest in source index")
+          print(atts[0]["digest"])
+          ')"
+          docker buildx imagetools inspect "${IMAGE}@${ATTEST_DIGEST}" --raw > /tmp/src-attestation.json
+          STATEMENT_DIGEST="$(python3 -c '
+          import json
+          data=json.load(open("/tmp/src-attestation.json"))
+          layers=[e for e in data.get("layers", []) if e.get("mediaType")=="application/vnd.in-toto+json" and (e.get("annotations") or {}).get("in-toto.io/predicate-type")=="https://slsa.dev/provenance/v1"]
+          if len(layers)!=1:
+              raise SystemExit("expected exactly one SLSA in-toto statement layer")
+          print(layers[0]["digest"])
+          ')"
+          REPO_PATH="${IMAGE#ghcr.io/}"
+          REGISTRY_TOKEN="$(curl -fsS --retry 3 --retry-all-errors --get \
+            --user "${GHCR_USER}:${GHCR_TOKEN}" \
+            --data-urlencode "service=ghcr.io" \
+            --data-urlencode "scope=repository:${REPO_PATH}:pull" \
+            https://ghcr.io/token | python3 -c 'import json,sys; data=json.load(sys.stdin); print(data.get("token") or data.get("access_token") or "")')"
+          [ -n "$REGISTRY_TOKEN" ] || { echo "::error::Could not obtain GHCR pull token"; exit 1; }
+          curl -fsS --location --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${REGISTRY_TOKEN}" \
+            "https://ghcr.io/v2/${REPO_PATH}/blobs/${STATEMENT_DIGEST}" \
+            > /tmp/src-statement.json
+          python3 deploy/verify-image-provenance.py \
+            --provenance /tmp/src-provenance.json \
+            --manifest /tmp/src-inspect.json \
+            --image-digest "$SOURCE_DIGEST" \
+            --attestation /tmp/src-attestation.json \
+            --statement /tmp/src-statement.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --revision "$FULL_SHA" \
+            --workflow-name "Docker Branch Images" \
+            --workflow-path .github/workflows/docker-branch.yml \
+            --job publish \
+            --ref refs/heads/debug \
+            --server-url "$GITHUB_SERVER_URL" > /tmp/src-builder.json
+          META_PUBLISHER_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/debug-image-metadata/debug-image.json"))["publisher_run_id"])')"
+          META_PUBLISHER_RUN_ATTEMPT="$(python3 -c 'import json; print(json.load(open("/tmp/debug-image-metadata/debug-image.json"))["publisher_run_attempt"])')"
+          PROVENANCE_RUN_ID="$(python3 -c 'import json; print(json.load(open("/tmp/src-builder.json"))["publisher_run_id"])')"
+          PROVENANCE_RUN_ATTEMPT="$(python3 -c 'import json; print(json.load(open("/tmp/src-builder.json"))["publisher_run_attempt"])')"
+          if [ "$META_PUBLISHER_RUN_ID" != "$PROVENANCE_RUN_ID" ] \
+            || [ "$META_PUBLISHER_RUN_ATTEMPT" != "$PROVENANCE_RUN_ATTEMPT" ]; then
+            echo "::error::debug-image metadata publisher does not match image SLSA provenance"
+            exit 1
+          fi
+          echo "Source image OK @ ${SOURCE_DIGEST}"
+
+      - name: Remote head check #2 immediately before promotion writes
+        env:
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin mine debug
+          MINE_SHA="$(git rev-parse origin/mine)"
+          DEBUG_SHA="$(git rev-parse origin/debug)"
+          if [ "${MINE_SHA}" != "${FULL_SHA}" ] || [ "${DEBUG_SHA}" != "${FULL_SHA}" ]; then
+            echo "::error::Remote heads moved before write: mine=${MINE_SHA} debug=${DEBUG_SHA} expected=${FULL_SHA}"
+            exit 1
+          fi
+          echo "Pre-write remote heads still match ${FULL_SHA}"
+
+      - name: Guard mine-sha tag (same digest reuse; different digest fail)
+        id: mine_sha
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          MINE_SHA_TAG: ${{ steps.input.outputs.mine_sha_tag }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          REF="${IMAGE}:${MINE_SHA_TAG}"
+          if ! docker buildx imagetools inspect "$REF" --format '{{json .}}' >/tmp/mine-sha-inspect.json 2>/tmp/mine-sha-inspect.err; then
+            if ! grep -Eqi 'not found|manifest unknown|name unknown' /tmp/mine-sha-inspect.err; then
+              echo "::error::Could not safely determine whether immutable tag ${REF} exists"
+              cat /tmp/mine-sha-inspect.err || true
+              exit 1
+            fi
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "No existing ${REF}; will carbon-copy."
+            exit 0
+          fi
+          GOT="$(python3 -c 'import json; print((json.load(open("/tmp/mine-sha-inspect.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${GOT}" != "${SOURCE_DIGEST}" ]; then
+            echo "::error::${REF} already exists with different digest ${GOT} (source ${SOURCE_DIGEST}); refusing overwrite"
+            exit 1
+          fi
+          echo "exists=true" >> "$GITHUB_OUTPUT"
+          echo "Existing ${REF} already matches source digest; reuse."
+
+      - name: Carbon-copy mine-sha immutable tag
+        if: steps.mine_sha.outputs.exists != 'true'
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          MINE_SHA_TAG: ${{ steps.input.outputs.mine_sha_tag }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          SRC="${IMAGE}@${SOURCE_DIGEST}"
+          docker buildx imagetools create --tag "${IMAGE}:${MINE_SHA_TAG}" "$SRC"
+          docker buildx imagetools inspect "${IMAGE}:${MINE_SHA_TAG}" --format '{{json .}}' > /tmp/mine-sha-written.json
+          GOT="$(python3 -c 'import json; print((json.load(open("/tmp/mine-sha-written.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${GOT}" != "${SOURCE_DIGEST}" ]; then
+            echo "::error::After write, ${MINE_SHA_TAG} digest ${GOT} != ${SOURCE_DIGEST}"
+            exit 1
+          fi
+          echo "Verified ${IMAGE}:${MINE_SHA_TAG} @ ${GOT}"
+
+      - name: Carbon-copy mine short-sha tag
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          MINE_COMPAT_TAG: ${{ steps.input.outputs.mine_compat_tag }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          SRC="${IMAGE}@${SOURCE_DIGEST}"
+          docker buildx imagetools create --tag "${IMAGE}:${MINE_COMPAT_TAG}" "$SRC"
+          docker buildx imagetools inspect "${IMAGE}:${MINE_COMPAT_TAG}" --format '{{json .}}' > /tmp/mine-compat-written.json
+          GOT="$(python3 -c 'import json; print((json.load(open("/tmp/mine-compat-written.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${GOT}" != "${SOURCE_DIGEST}" ]; then
+            echo "::error::After write, ${MINE_COMPAT_TAG} digest ${GOT} != ${SOURCE_DIGEST}"
+            exit 1
+          fi
+          echo "Verified ${IMAGE}:${MINE_COMPAT_TAG} @ ${GOT}"
+
+      - name: Remote head check immediately before floating mine
+        env:
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin mine debug
+          MINE_SHA="$(git rev-parse origin/mine)"
+          DEBUG_SHA="$(git rev-parse origin/debug)"
+          if [ "${MINE_SHA}" != "${FULL_SHA}" ] || [ "${DEBUG_SHA}" != "${FULL_SHA}" ]; then
+            echo "::error::Remote heads moved before floating mine write: mine=${MINE_SHA} debug=${DEBUG_SHA} expected=${FULL_SHA}"
+            exit 1
+          fi
+          echo "Pre-floating-tag remote heads still match ${FULL_SHA}"
+
+      - name: Carbon-copy floating mine tag (last)
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          MINE_FLOAT_TAG: ${{ steps.input.outputs.mine_float_tag }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+        run: |
+          set -euo pipefail
+          SRC="${IMAGE}@${SOURCE_DIGEST}"
+          docker buildx imagetools create --tag "${IMAGE}:${MINE_FLOAT_TAG}" "$SRC"
+          docker buildx imagetools inspect "${IMAGE}:${MINE_FLOAT_TAG}" --format '{{json .}}' > /tmp/mine-float-written.json
+          GOT="$(python3 -c 'import json; print((json.load(open("/tmp/mine-float-written.json")).get("manifest") or {}).get("digest", ""))')"
+          if [ "${GOT}" != "${SOURCE_DIGEST}" ]; then
+            echo "::error::After write, ${MINE_FLOAT_TAG} digest ${GOT} != ${SOURCE_DIGEST}"
+            exit 1
+          fi
+          echo "Verified ${IMAGE}:${MINE_FLOAT_TAG} @ ${GOT}"
+
+      - name: Write promotion.json artifact
+        env:
+          FULL_SHA: ${{ steps.input.outputs.full_sha }}
+          SOURCE_DIGEST: ${{ inputs.source_digest }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          EVIDENCE_SHA256: ${{ inputs.verification_evidence_sha256 }}
+          IMAGE: ${{ steps.input.outputs.image }}
+          MINE_SHA_TAG: ${{ steps.input.outputs.mine_sha_tag }}
+          MINE_COMPAT_TAG: ${{ steps.input.outputs.mine_compat_tag }}
+          MINE_FLOAT_TAG: ${{ steps.input.outputs.mine_float_tag }}
+          SOURCE_TAG: ${{ steps.input.outputs.source_tag }}
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -c '
+          import json, os
+          source_meta = json.load(open("/tmp/debug-image-metadata/debug-image.json", encoding="utf-8"))
+          payload = {
+              "schema_version": 1,
+              "promotion_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "promotion_run_url": "%s/%s/actions/runs/%s" % (
+                  os.environ.get("GITHUB_SERVER_URL"),
+                  os.environ.get("GITHUB_REPOSITORY"),
+                  os.environ.get("GITHUB_RUN_ID"),
+              ),
+              "actor": os.environ.get("GITHUB_ACTOR"),
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "revision": os.environ["FULL_SHA"],
+              "source_digest": os.environ["SOURCE_DIGEST"],
+              "target_digest": os.environ["SOURCE_DIGEST"],
+              "source_run_id": os.environ["SOURCE_RUN_ID"],
+              "publisher_run_id": source_meta["publisher_run_id"],
+              "publisher_run_attempt": source_meta["publisher_run_attempt"],
+              "reused_existing_debug_image": source_meta["reused_existing"],
+              "verification_evidence_sha256": os.environ["EVIDENCE_SHA256"],
+              "evidence_binding_mode": "recorded-hash-production-apply-verifies-local-file",
+              "tags": [
+                  os.environ["MINE_SHA_TAG"],
+                  os.environ["MINE_COMPAT_TAG"],
+                  os.environ["MINE_FLOAT_TAG"],
+              ],
+              "image": os.environ["IMAGE"],
+              "source_tag": os.environ["SOURCE_TAG"],
+              "mine_sha_tag": os.environ["MINE_SHA_TAG"],
+              "mine_compat_tag": os.environ["MINE_COMPAT_TAG"],
+              "mine_float_tag": os.environ["MINE_FLOAT_TAG"],
+              "method": "buildx-imagetools-carbon-copy",
+              "built": False,
+              "ref_name_claim": "debug-preserved",
+              "source_metadata_artifact": "debug-image-metadata",
+          }
+          with open("promotion.json", "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, sort_keys=True)
+              f.write("\n")
+          os.chmod("promotion.json", 0o600)
+          print(json.dumps(payload, indent=2, sort_keys=True))
+          '
+
+      - name: Upload promotion artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: promotion-json
+          path: promotion.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
