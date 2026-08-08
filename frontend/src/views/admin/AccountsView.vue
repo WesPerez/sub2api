@@ -347,6 +347,14 @@
               </div>
             </div>
           </template>
+          <template #cell-model_config="{ row }">
+            <span
+              class="block max-w-[18rem] truncate text-sm text-gray-700 dark:text-gray-300"
+              :title="formatAccountModels(row)"
+            >
+              {{ formatAccountModels(row) }}
+            </span>
+          </template>
           <template #cell-rate_multiplier="{ row }">
             <span class="inline-flex items-center gap-1 text-sm font-mono text-gray-700 dark:text-gray-300">
               <span>{{ formatMultiplier(row.rate_multiplier ?? 1) }}x</span>
@@ -450,14 +458,14 @@
       </template>
       <template #pagination><Pagination v-if="pagination.total > 0" :page="pagination.page" :total="pagination.total" :page-size="pagination.page_size" @update:page="handlePageChange" @update:pageSize="handlePageSizeChange" /></template>
     </TablePageLayout>
-    <CreateAccountModal :show="showCreate" :proxies="proxies" :groups="groups" @close="showCreate = false" @created="reload" />
+    <CreateAccountModal :show="showCreate" :proxies="proxies" :groups="groups" @close="showCreate = false" @created="load" />
     <EditAccountModal :show="showEdit" :account="edAcc" :proxies="proxies" :groups="groups" @close="showEdit = false" @updated="handleAccountUpdated" />
     <ReAuthAccountModal :show="showReAuth" :account="reAuthAcc" @close="closeReAuthModal" @reauthorized="handleAccountUpdated" />
     <AccountTestModal :show="showTest" :account="testingAcc" @close="closeTestModal" />
     <AccountStatsModal :show="showStats" :account="statsAcc" @close="closeStatsModal" />
     <ScheduledTestsPanel :show="showSchedulePanel" :account-id="scheduleAcc?.id ?? null" :model-options="scheduleModelOptions" @close="closeSchedulePanel" />
     <AccountActionMenu :show="menu.show" :account="menu.acc" :position="menu.pos" @close="menu.show = false" @test="handleTest" @stats="handleViewStats" @schedule="handleSchedule" @duplicate="handleDuplicateAccount" @reauth="handleReAuth" @refresh-token="handleRefresh" @recover-state="handleRecoverState" @reset-quota="handleResetQuota" @set-privacy="handleSetPrivacy" @create-spark-shadow="handleCreateSparkShadow" />
-    <SyncFromCrsModal :show="showSync" @close="showSync = false" @synced="reload" />
+    <SyncFromCrsModal :show="showSync" @close="showSync = false" @synced="load" />
     <ImportDataModal :show="showImportData" @close="showImportData = false" @imported="handleDataImported" />
     <BulkEditAccountModal
       :show="showBulkEdit"
@@ -532,6 +540,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
+import { splitModelMappingObject } from '@/composables/useModelWhitelist'
 import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
@@ -1064,7 +1073,6 @@ const {
   params,
   pagination,
   load: baseLoad,
-  reload: baseReload,
   debouncedReload: baseDebouncedReload,
   handlePageChange: baseHandlePageChange,
   handlePageSizeChange: baseHandlePageSizeChange
@@ -1148,6 +1156,7 @@ function markUpstreamBillingSortRefresh() {
 }
 
 const load = async () => {
+  const requestedPage = pagination.page
   const requestParams = params as any
   markUpstreamBillingSortRefresh()
   syncAccountListDerivedParams()
@@ -1158,20 +1167,16 @@ const load = async () => {
     requestParams.lite = '1'
   }
   await baseLoad()
+  // Operations retain the current page unless it no longer exists after a removal.
+  const lastPage = Math.max(1, pagination.pages)
+  if (pagination.page === requestedPage && requestedPage > lastPage) {
+    pagination.page = lastPage
+    await baseLoad()
+  }
   if (isFirstLoad.value) {
     isFirstLoad.value = false
     delete requestParams.lite
   }
-  await refreshTodayStatsBatch()
-}
-
-const reload = async () => {
-  markUpstreamBillingSortRefresh()
-  syncAccountListDerivedParams()
-  hasPendingListSync.value = false
-  resetAutoRefreshCache()
-  pendingTodayStatsRefresh.value = false
-  await baseReload()
   await refreshTodayStatsBatch()
 }
 
@@ -1182,7 +1187,7 @@ const refreshUpstreamBillingSortedList = async (force = false) => {
   if (!force && lastUpstreamBillingSortRefreshMinute === minute) return
   lastUpstreamBillingSortRefreshMinute = minute
   try {
-    await reload()
+    await load()
   } catch (error) {
     console.error('Failed to refresh upstream billing sort:', error)
   }
@@ -1629,6 +1634,34 @@ function accountHomepageUrl(row: Account): string {
   return baseUrl ? new URL(baseUrl).origin : ''
 }
 
+function formatAccountModels(row: Account): string {
+  if (row.platform === 'openai') {
+    const extra = (row.extra || {}) as Record<string, unknown>
+    const passthrough = typeof extra.openai_passthrough === 'boolean'
+      ? extra.openai_passthrough
+      : extra.openai_oauth_passthrough === true
+    if (passthrough) return t('admin.accounts.openai.modelRestrictionDisabledByPassthrough')
+  }
+
+  const rawMapping = row.credentials?.model_mapping
+  if (rawMapping && typeof rawMapping === 'object' && !Array.isArray(rawMapping)) {
+    const { allowedModels, modelMappings } = splitModelMappingObject(rawMapping as Record<string, unknown>)
+    const entries = [
+      ...allowedModels,
+      ...modelMappings.map(({ from, to }) => `${from} -> ${to}`)
+    ].sort((left, right) => left.localeCompare(right))
+    if (entries.length > 0) return entries.join(', ')
+  }
+
+  const legacy = row.credentials?.model_whitelist
+  if (Array.isArray(legacy)) {
+    const entries = [...new Set(legacy.map(String).map(value => value.trim()).filter(Boolean))].sort()
+    if (entries.length > 0) return entries.join(', ')
+  }
+
+  return t('admin.accounts.supportsAllModels')
+}
+
 type OpenAICompactBadgeState = 'active' | 'blocked' | 'auto'
 
 function getOpenAICompactState(row: any): OpenAICompactBadgeState | null {
@@ -1704,6 +1737,7 @@ const allColumns = computed(() => {
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
   c.push(
     { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
+    { key: 'model_config', label: t('admin.accounts.columns.models'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },
     { key: 'scheduler_score', label: t('admin.accounts.columns.schedulerScore'), sortable: false },
     { key: 'rate_multiplier', label: t('admin.accounts.columns.billingRateMultiplier'), sortable: true },
@@ -1800,7 +1834,7 @@ const handleBulkDelete = async () => {
       appStore.showSuccess(t('admin.accounts.bulkActions.deleteSuccess', { count: result.success }))
       clearSelection()
     }
-    await reload()
+    await load()
   } catch (error) {
     console.error('Failed to bulk delete accounts:', error)
     appStore.showError(String(error))
@@ -1816,7 +1850,7 @@ const handleBulkResetStatus = async () => {
       appStore.showSuccess(t('admin.accounts.bulkActions.resetStatusSuccess', { count: result.success }))
       clearSelection()
     }
-    reload()
+    await load()
   } catch (error) {
     console.error('Failed to bulk reset status:', error)
     appStore.showError(String(error))
@@ -1832,7 +1866,7 @@ const handleBulkRefreshToken = async () => {
       appStore.showSuccess(t('admin.accounts.bulkActions.refreshTokenSuccess', { count: result.success }))
       clearSelection()
     }
-    reload()
+    await load()
   } catch (error) {
     console.error('Failed to bulk refresh token:', error)
     appStore.showError(String(error))
@@ -2049,9 +2083,9 @@ const handleBulkUpdated = () => {
   showBulkEdit.value = false
   bulkEditTarget.value = null
   clearSelection()
-  reload()
+  load()
 }
-const handleDataImported = () => { showImportData.value = false; reload() }
+const handleDataImported = () => { showImportData.value = false; load() }
 const ACCOUNT_UNGROUPED_GROUP_QUERY_VALUE = 'ungrouped'
 const ACCOUNT_PRIVACY_MODE_UNSET_QUERY_VALUE = '__unset__'
 const buildAccountQueryFilters = () => ({
@@ -2264,7 +2298,7 @@ const handleDuplicateAccount = async (a: Account) => {
   try {
     const duplicate = await adminAPI.accounts.duplicate(a.id)
     appStore.showSuccess(t('admin.accounts.duplicateSuccess', { name: duplicate.name }))
-    reload()
+    await load()
   } catch (error: any) {
     console.error('Failed to duplicate account:', error)
     appStore.showError(error?.message || t('admin.accounts.duplicateFailed'))
@@ -2344,7 +2378,7 @@ const onRevertFallback = async (a: Account) => {
   try {
     await adminAPI.accounts.revertProxyFallback(a.id)
     appStore.showSuccess(t('admin.accounts.revertProxySuccess'))
-    reload()
+    await load()
   } catch (error: any) {
     console.error('Failed to revert proxy fallback:', error)
     appStore.showError(error?.response?.data?.message || t('admin.accounts.revertProxyFailed'))
@@ -2362,14 +2396,14 @@ const confirmCreateSparkShadow = async () => {
     showCreateShadowDialog.value = false
     creatingShadowAcc.value = null
     appStore.showSuccess(t('admin.accounts.createSparkShadowSuccess'))
-    reload()
+    await load()
   } catch (error: any) {
     console.error('Failed to create spark shadow:', error)
     appStore.showError(error?.response?.data?.message || t('admin.accounts.createSparkShadowFailed'))
   }
 }
 const handleDelete = (a: Account) => { deletingAcc.value = a; showDeleteDialog.value = true }
-const confirmDelete = async () => { if(!deletingAcc.value) return; try { await adminAPI.accounts.delete(deletingAcc.value.id); showDeleteDialog.value = false; deletingAcc.value = null; reload() } catch (error) { console.error('Failed to delete account:', error) } }
+const confirmDelete = async () => { if(!deletingAcc.value) return; try { await adminAPI.accounts.delete(deletingAcc.value.id); showDeleteDialog.value = false; deletingAcc.value = null; await load() } catch (error) { console.error('Failed to delete account:', error) } }
 const handleToggleSchedulable = async (a: Account) => {
   const nextSchedulable = !a.schedulable
   togglingSchedulable.value = a.id

@@ -6,6 +6,8 @@ import AccountActionMenu from '@/components/admin/account/AccountActionMenu.vue'
 import PlatformTypeBadge from '@/components/common/PlatformTypeBadge.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import HelpTooltip from '@/components/common/HelpTooltip.vue'
+import AccountBulkActionsBar from '@/components/admin/account/AccountBulkActionsBar.vue'
+import EditAccountModal from '@/components/account/EditAccountModal.vue'
 
 // 外审 F2:AccountActionMenu emit 'create-spark-shadow',但 AccountsView 此前未监听,
 // 导致按钮点击无效。本测试通过真实组件引用 emit 该事件,断言父页面接线调用 API。
@@ -16,6 +18,10 @@ const {
   getAllProxies,
   getAllGroups,
   duplicateAccount,
+  deleteAccount,
+  batchDelete,
+  batchClearError,
+  batchRefresh,
   createSparkShadow,
   showSuccess,
   showError
@@ -26,6 +32,10 @@ const {
   getAllProxies: vi.fn(),
   getAllGroups: vi.fn(),
   duplicateAccount: vi.fn(),
+  deleteAccount: vi.fn(),
+  batchDelete: vi.fn(),
+  batchClearError: vi.fn(),
+  batchRefresh: vi.fn(),
   createSparkShadow: vi.fn(),
   showSuccess: vi.fn(),
   showError: vi.fn()
@@ -40,9 +50,10 @@ vi.mock('@/api/admin', () => ({
       duplicate: duplicateAccount,
       getUpstreamBillingProbeSettings: vi.fn().mockResolvedValue({ enabled: true, interval_minutes: 30 }),
       createSparkShadow,
-      delete: vi.fn(),
-      batchClearError: vi.fn(),
-      batchRefresh: vi.fn(),
+      delete: deleteAccount,
+      batchDelete,
+      batchClearError,
+      batchRefresh,
       toggleSchedulable: vi.fn()
     },
     proxies: { getAll: getAllProxies },
@@ -66,6 +77,13 @@ vi.mock('vue-i18n', async () => {
   }
 })
 
+const PaginationStub = {
+  name: 'Pagination',
+  props: ['page', 'total', 'pageSize'],
+  emits: ['update:page'],
+  template: '<div />'
+}
+
 const mountView = () =>
   mount(AccountsView, {
     global: {
@@ -74,8 +92,11 @@ const mountView = () =>
         TablePageLayout: {
           template: '<div><slot name="filters" /><slot name="table" /><slot name="pagination" /></div>'
         },
-        DataTable: true,
-        Pagination: true,
+        DataTable: {
+          props: ['data'],
+          template: '<div><div v-for="row in data" :key="row.id"><slot name="cell-actions" :row="row" /></div></div>'
+        },
+        Pagination: PaginationStub,
         ConfirmDialog: true,
         AccountTableActions: { template: '<div><slot name="beforeCreate" /><slot name="after" /></div>' },
         AccountTableFilters: { template: '<div></div>' },
@@ -107,25 +128,42 @@ const mountView = () =>
 describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   beforeEach(() => {
     localStorage.clear()
-    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, createSparkShadow, showSuccess, showError]) {
+    for (const fn of [listAccounts, listWithEtag, getBatchTodayStats, getAllProxies, getAllGroups, duplicateAccount, deleteAccount, batchDelete, batchClearError, batchRefresh, createSparkShadow, showSuccess, showError]) {
       fn.mockReset()
     }
-    listAccounts.mockResolvedValue({ items: [], total: 0, page: 1, page_size: 20, pages: 0 })
+    listAccounts.mockImplementation((page: number) => Promise.resolve({
+      items: [],
+      total: 100,
+      page,
+      page_size: 20,
+      pages: 5
+    }))
     listWithEtag.mockResolvedValue({ notModified: true, etag: null, data: null })
     getBatchTodayStats.mockResolvedValue({ stats: {} })
     getAllProxies.mockResolvedValue([])
     getAllGroups.mockResolvedValue([])
     duplicateAccount.mockResolvedValue({ id: 998, name: 'parent-acc (Copy)' })
     createSparkShadow.mockResolvedValue({ id: 999, name: 'parent-acc (Spark)' })
+    deleteAccount.mockResolvedValue(undefined)
+    for (const fn of [batchDelete, batchClearError, batchRefresh]) {
+      fn.mockResolvedValue({ success: 1, failed: 0 })
+    }
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
   })
 
-  it('AccountActionMenu 的 duplicate 事件一键复制账号并刷新列表', async () => {
+  it('AccountActionMenu 的 duplicate 事件一键复制账号并保留当前页码', async () => {
     const wrapper = mountView()
     await flushPromises()
+
+    listAccounts.mockClear()
+    const pagination = wrapper.findComponent(PaginationStub)
+    pagination.vm.$emit('update:page', 3)
+    await flushPromises()
+    expect(listAccounts).toHaveBeenLastCalledWith(3, 20, expect.anything(), expect.anything())
 
     wrapper.findComponent(AccountActionMenu).vm.$emit('duplicate', { id: 42, name: 'parent-acc' })
     await flushPromises()
@@ -133,7 +171,7 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     expect(duplicateAccount).toHaveBeenCalledTimes(1)
     expect(duplicateAccount).toHaveBeenCalledWith(42)
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.duplicateSuccess')
-    expect(listAccounts.mock.calls.length).toBeGreaterThan(1)
+    expect(listAccounts).toHaveBeenLastCalledWith(3, 20, expect.anything(), expect.anything())
     wrapper.unmount()
   })
 
@@ -171,6 +209,8 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
   it('AccountActionMenu 的 create-spark-shadow 事件触发 createSparkShadow API + 成功提示', async () => {
     const wrapper = mountView()
     await flushPromises()
+    wrapper.findComponent(PaginationStub).vm.$emit('update:page', 3)
+    await flushPromises()
 
     const menu = wrapper.findComponent(AccountActionMenu)
     expect(menu.exists()).toBe(true)
@@ -187,6 +227,7 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     expect(createSparkShadow).toHaveBeenCalledTimes(1)
     expect(createSparkShadow).toHaveBeenCalledWith(42, { name: 'parent-acc (Spark)' })
     expect(showSuccess).toHaveBeenCalledWith('admin.accounts.createSparkShadowSuccess')
+    expect(listAccounts).toHaveBeenLastCalledWith(3, 20, expect.anything(), expect.anything())
     wrapper.unmount()
   })
 
@@ -204,6 +245,116 @@ describe('admin AccountsView — 外审 F2:spark 影子创建接线', () => {
     await flushPromises()
 
     expect(createSparkShadow).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['delete', batchDelete],
+    ['reset-status', batchClearError],
+    ['refresh-token', batchRefresh]
+  ] as const)('bulk %s retains the current page', async (event, api) => {
+    listAccounts.mockResolvedValue({ items: [{ id: 42, name: 'parent-acc' }], total: 45, pages: 3 })
+    const wrapper = mountView()
+    await flushPromises()
+    const pagination = wrapper.findComponent(PaginationStub)
+    pagination.vm.$emit('update:page', 3)
+    await flushPromises()
+
+    const bulkActions = wrapper.findComponent(AccountBulkActionsBar)
+    bulkActions.vm.$emit('select-page')
+    bulkActions.vm.$emit(event)
+    await flushPromises()
+
+    expect(api).toHaveBeenCalledTimes(1)
+    expect(api).toHaveBeenCalledWith([42])
+    expect(listAccounts).toHaveBeenLastCalledWith(3, 20, expect.anything(), expect.anything())
+    expect(pagination.props('page')).toBe(3)
+    wrapper.unmount()
+  })
+
+  it.each([
+    ['BulkEditAccountModal', 'updated'],
+    ['CreateAccountModal', 'created'],
+    ['SyncFromCrsModal', 'synced'],
+    ['ImportDataModal', 'imported']
+  ] as const)('retains the current page after modal completion %#', async (component, event) => {
+    const wrapper = mountView()
+    await flushPromises()
+    wrapper.findComponent(PaginationStub).vm.$emit('update:page', 3)
+    await flushPromises()
+
+    wrapper.findComponent({ name: component }).vm.$emit(event)
+    await flushPromises()
+
+    expect(listAccounts).toHaveBeenLastCalledWith(3, 20, expect.anything(), expect.anything())
+    wrapper.unmount()
+  })
+
+  it('editing an account updates the row without reloading or changing page', async () => {
+    const account = { id: 42, name: 'parent-acc', status: 'active', platform: 'openai', type: 'apikey' }
+    listAccounts.mockResolvedValue({ items: [account], total: 45, pages: 3 })
+    const wrapper = mountView()
+    await flushPromises()
+    const pagination = wrapper.findComponent(PaginationStub)
+    pagination.vm.$emit('update:page', 3)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text() === 'common.edit')!.trigger('click')
+    listAccounts.mockClear()
+
+    wrapper.findComponent(EditAccountModal).vm.$emit('updated', { ...account, name: 'updated' })
+    await flushPromises()
+
+    expect(listAccounts).not.toHaveBeenCalled()
+    expect(pagination.props('page')).toBe(3)
+    expect(wrapper.findComponent(EditAccountModal).props('account')?.name).toBe('updated')
+    wrapper.unmount()
+  })
+
+  it.each([
+    [45, 3],
+    [41, 2]
+  ])('deleting from page 3 with %i accounts finishes on page %i', async (initialTotal, expectedPage) => {
+    let total = initialTotal
+    listAccounts.mockImplementation((page: number) => Promise.resolve({
+      items: page <= Math.ceil(total / 20) ? [{ id: 42, name: 'parent-acc' }] : [],
+      total,
+      pages: Math.ceil(total / 20)
+    }))
+    deleteAccount.mockImplementation(async () => { total-- })
+    const wrapper = mountView()
+    await flushPromises()
+    const pagination = wrapper.findComponent(PaginationStub)
+    pagination.vm.$emit('update:page', 3)
+    await flushPromises()
+    listAccounts.mockClear()
+
+    await wrapper.findAll('button').find(button => button.text() === 'common.delete')!.trigger('click')
+    wrapper.findAllComponents(ConfirmDialog).find(dialog => dialog.props('show'))!.vm.$emit('confirm')
+    await flushPromises()
+
+    expect(deleteAccount).toHaveBeenCalledWith(42)
+    expect(pagination.props('page')).toBe(expectedPage)
+    expect(listAccounts).toHaveBeenLastCalledWith(expectedPage, 20, expect.anything(), expect.anything())
+    expect(listAccounts.mock.calls.every(([page]) => page !== 1)).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('partial bulk deletion clamps to the last page using the server total', async () => {
+    const wrapper = mountView()
+    await flushPromises()
+    wrapper.findComponent(PaginationStub).vm.$emit('update:page', 3)
+    await flushPromises()
+    listAccounts.mockClear()
+    listAccounts.mockResolvedValue({ items: [], total: 40, pages: 2 })
+    batchDelete.mockResolvedValue({ success: 1, failed: 1, failed_ids: [42] })
+
+    wrapper.findComponent(AccountBulkActionsBar).vm.$emit('delete')
+    await flushPromises()
+
+    expect(wrapper.findComponent(PaginationStub).props('page')).toBe(2)
+    expect(wrapper.findComponent(AccountBulkActionsBar).props('selectedIds')).toEqual([42])
+    expect(listAccounts).toHaveBeenLastCalledWith(2, 20, expect.anything(), expect.anything())
+    expect(listAccounts.mock.calls.every(([page]) => page !== 1)).toBe(true)
     wrapper.unmount()
   })
 })
