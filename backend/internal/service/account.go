@@ -81,6 +81,27 @@ type Account struct {
 	headerOverrideCacheRawSig         uint64
 }
 
+// ProxyIdentityAccountID keeps credential-shadow accounts on their parent's
+// Resin identity instead of allocating a second dynamic exit.
+func (a *Account) ProxyIdentityAccountID() int64 {
+	if a == nil {
+		return 0
+	}
+	if a.ParentAccountID != nil && *a.ParentAccountID > 0 {
+		return *a.ParentAccountID
+	}
+	return a.ID
+}
+
+// BindProxyIdentity resolves the username template once when an account is
+// hydrated. Existing business paths can continue using Proxy.URL().
+func (a *Account) BindProxyIdentity() {
+	if a == nil || a.Proxy == nil {
+		return
+	}
+	a.Proxy = a.Proxy.ForAccount(a.ProxyIdentityAccountID())
+}
+
 type OpenAIEndpointCapability string
 
 const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
