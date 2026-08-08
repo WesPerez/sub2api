@@ -327,6 +327,7 @@ func (r *accountRepository) GetByIDs(ctx context.Context, ids []int64) ([]*servi
 		// Prefer the preloaded proxy edge when available.
 		if entAcc.Edges.Proxy != nil {
 			out.Proxy = proxyEntityToService(entAcc.Edges.Proxy)
+			out.BindProxyIdentity()
 		}
 
 		if groups, ok := groupsByAccount[entAcc.ID]; ok {
@@ -2775,11 +2776,19 @@ func lockAndMatchProbeProxyIdentity(ctx context.Context, client *dbent.Client, a
 	if account.Proxy == nil || account.Proxy.ID != *account.ProxyID {
 		return false, nil
 	}
-	var current proxyProbeIdentity
-	if err := rows.Scan(&current.protocol, &current.host, &current.port, &current.username, &current.password, &current.status); err != nil {
+	currentProxy := &service.Proxy{ID: *account.ProxyID}
+	if err := rows.Scan(
+		&currentProxy.Protocol,
+		&currentProxy.Host,
+		&currentProxy.Port,
+		&currentProxy.Username,
+		&currentProxy.Password,
+		&currentProxy.Status,
+	); err != nil {
 		return false, err
 	}
-	return current == proxyProbeIdentityFromService(account.Proxy), rows.Err()
+	currentProxy = currentProxy.ForAccount(account.ProxyIdentityAccountID())
+	return proxyProbeIdentityFromService(currentProxy) == proxyProbeIdentityFromService(account.Proxy), rows.Err()
 }
 
 func shouldEnqueueSchedulerOutboxForExtraUpdates(updates map[string]any) bool {
@@ -3151,6 +3160,7 @@ func (r *accountRepository) accountsToService(ctx context.Context, accounts []*d
 		if acc.ProxyID != nil {
 			if proxy, ok := proxyMap[*acc.ProxyID]; ok {
 				out.Proxy = proxy
+				out.BindProxyIdentity()
 			}
 		}
 		out.ProxyFallbackOriginID = acc.ProxyFallbackOriginID

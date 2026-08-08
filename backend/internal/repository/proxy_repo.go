@@ -222,7 +222,7 @@ func lockProxyProbeIdentity(ctx context.Context, client *dbent.Client, proxyID i
 }
 
 func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyID int64) ([]int64, error) {
-	rows, err := exec.QueryContext(ctx, `
+	if _, err := exec.ExecContext(ctx, `
 		UPDATE accounts
 		SET extra = COALESCE(extra, '{}'::jsonb)
 				- 'upstream_billing_probe'
@@ -238,7 +238,18 @@ func invalidateProxyProbeSnapshots(ctx context.Context, exec sqlExecutor, proxyI
 					AND extra -> 'ollama_cloud_usage_snapshot' <> 'null'::jsonb)
 			)
 			AND deleted_at IS NULL
-		RETURNING id
+	`, proxyID); err != nil {
+		return nil, err
+	}
+
+	// A proxy identity change invalidates every hydrated account snapshot,
+	// including accounts that do not currently carry a billing probe result.
+	rows, err := exec.QueryContext(ctx, `
+		SELECT id
+		FROM accounts
+		WHERE proxy_id = $1
+			AND deleted_at IS NULL
+		ORDER BY id
 	`, proxyID)
 	if err != nil {
 		return nil, err

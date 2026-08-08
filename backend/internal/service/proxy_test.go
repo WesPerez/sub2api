@@ -93,3 +93,68 @@ func TestProxyURL_SpecialCharactersRoundTrip(t *testing.T) {
 		t.Fatalf("password mismatch after parse: got=%q want=%q", pass, proxy.Password)
 	}
 }
+
+func TestProxyURLForAccountExpandsTemplateWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	proxy := Proxy{
+		ID:       7,
+		Protocol: "socks5h",
+		Host:     "172.17.0.1",
+		Port:     10834,
+		Username: "OpenAI.sub2-{{account_id}}",
+		Password: "secret",
+	}
+
+	if got := proxy.URLForAccount(42); got != "socks5h://OpenAI.sub2-42:secret@172.17.0.1:10834" {
+		t.Fatalf("URLForAccount mismatch: %q", got)
+	}
+	if got := proxy.URL(); got != "socks5h://OpenAI.sub2-profile-7:secret@172.17.0.1:10834" {
+		t.Fatalf("generic profile URL mismatch: %q", got)
+	}
+	if proxy.Username != "OpenAI.sub2-{{account_id}}" {
+		t.Fatalf("template proxy was mutated: %q", proxy.Username)
+	}
+}
+
+func TestAccountBindProxyIdentityUsesParentAndClonesSharedProxy(t *testing.T) {
+	t.Parallel()
+
+	parentID := int64(42)
+	shared := &Proxy{
+		ID:       7,
+		Protocol: "socks5h",
+		Host:     "172.17.0.1",
+		Port:     10834,
+		Username: "OpenAI.sub2-{{account_id}}",
+		Password: "secret",
+	}
+	parent := &Account{ID: parentID, Proxy: shared}
+	shadow := &Account{ID: 99, ParentAccountID: &parentID, Proxy: shared}
+
+	parent.BindProxyIdentity()
+	shadow.BindProxyIdentity()
+
+	if parent.Proxy == shared || shadow.Proxy == shared || parent.Proxy == shadow.Proxy {
+		t.Fatal("account hydration must clone the shared proxy")
+	}
+	for name, account := range map[string]*Account{"parent": parent, "shadow": shadow} {
+		if got := account.Proxy.URL(); got != "socks5h://OpenAI.sub2-42:secret@172.17.0.1:10834" {
+			t.Fatalf("%s proxy identity mismatch: %q", name, got)
+		}
+	}
+}
+
+func TestValidateProxyUsernameTemplate(t *testing.T) {
+	t.Parallel()
+
+	if err := ValidateProxyUsernameTemplate("OpenAI.sub2-{{account_id}}"); err != nil {
+		t.Fatalf("valid template rejected: %v", err)
+	}
+	if err := ValidateProxyUsernameTemplate("OpenAI.sub2-{{unknown}}"); err == nil {
+		t.Fatal("unsupported template should be rejected")
+	}
+	if err := ValidateProxyUsernameTemplate("OpenAI.sub2-{account_id}"); err == nil {
+		t.Fatal("single-brace template should be rejected")
+	}
+}
