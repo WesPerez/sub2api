@@ -73,6 +73,20 @@ type openAIAccountTestRepo struct {
 	setErrorMsg        string
 }
 
+func fixedDynamicAccountTestTask() dynamicAccountTestTask {
+	return dynamicAccountTestTask{
+		Prompt: "Connection check fixture-marker: add 20 and 22. Reply in one short sentence containing the marker fixture-marker and the computed sum.",
+		Marker: "fixture-marker",
+		Result: "42",
+	}
+}
+
+func fixedDynamicAccountTestTaskFactory() (dynamicAccountTestTask, error) {
+	return fixedDynamicAccountTestTask(), nil
+}
+
+const fixedDynamicAccountTestResponse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"fixture-marker 42\"}\n\ndata: {\"type\":\"response.completed\"}\n\n"
+
 func (r *openAIAccountTestRepo) UpdateExtra(_ context.Context, _ int64, updates map[string]any) error {
 	r.updatedExtra = updates
 	return nil
@@ -106,9 +120,7 @@ func TestAccountTestService_OpenAISuccessPersistsSnapshotFromHeaders(t *testing.
 	ctx, recorder := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(fixedDynamicAccountTestResponse))
 	resp.Header.Set("x-codex-primary-used-percent", "88")
 	resp.Header.Set("x-codex-primary-reset-after-seconds", "604800")
 	resp.Header.Set("x-codex-primary-window-minutes", "10080")
@@ -118,7 +130,7 @@ func TestAccountTestService_OpenAISuccessPersistsSnapshotFromHeaders(t *testing.
 
 	repo := &openAIAccountTestRepo{}
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream}
+	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream, newDynamicOpenAITask: fixedDynamicAccountTestTaskFactory}
 	account := &Account{
 		ID:          89,
 		Platform:    PlatformOpenAI,
@@ -142,12 +154,10 @@ func TestAccountTestService_OpenAIOAuthTestNormalizesGPT56Alias(t *testing.T) {
 	ctx, _ := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(fixedDynamicAccountTestResponse))
 
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-	svc := &AccountTestService{httpUpstream: upstream}
+	svc := &AccountTestService{httpUpstream: upstream, newDynamicOpenAITask: fixedDynamicAccountTestTaskFactory}
 	account := &Account{
 		ID:          90,
 		Platform:    PlatformOpenAI,
@@ -170,9 +180,7 @@ func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *t
 	ctx, recorder := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader(`data: {"type":"response.completed"}
-
-`))
+	resp.Body = io.NopCloser(strings.NewReader(fixedDynamicAccountTestResponse))
 
 	parentID := int64(100)
 	parent := &Account{
@@ -209,7 +217,7 @@ func TestAccountTestService_OpenAIShadowUsesParentCredentialsAndShadowModel(t *t
 		},
 	}
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
-	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream}
+	svc := &AccountTestService{accountRepo: repo, httpUpstream: upstream, newDynamicOpenAITask: fixedDynamicAccountTestTaskFactory}
 
 	err := svc.TestAccountConnection(ctx, shadow.ID, "gpt-5.3-codex-spark", "", "")
 	require.NoError(t, err)
@@ -429,10 +437,11 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUsesCodexProbeHeaders(t *testin
 	ctx, _ := newTestContext()
 
 	resp := newJSONResponse(http.StatusOK, "")
-	resp.Body = io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
+	resp.Body = io.NopCloser(strings.NewReader(fixedDynamicAccountTestResponse))
 	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
 	svc := &AccountTestService{
 		httpUpstream: upstream,
+		newDynamicOpenAITask: fixedDynamicAccountTestTaskFactory,
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
@@ -453,6 +462,29 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUsesCodexProbeHeaders(t *testin
 	req := upstream.requests[0]
 	require.Equal(t, "https://compat-upstream.example/v1/responses", req.URL.String())
 	requireOpenAICodexProbeHeaders(t, req.Header)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	prompt := gjson.GetBytes(body, "input.0.content.0.text").String()
+	require.Contains(t, prompt, "Connection check ")
+	require.NotEqual(t, "hi", prompt)
+}
+
+func TestNewDynamicAccountTestTaskWithEntropy(t *testing.T) {
+	task, err := newDynamicAccountTestTaskWithEntropy(strings.NewReader("0123456789"))
+	require.NoError(t, err)
+	require.Contains(t, task.Prompt, "Connection check dedfdgdhdjdk")
+	require.Contains(t, task.Prompt, "add 17 and 81")
+	require.NotContains(t, task.Prompt, "98")
+	require.Equal(t, "dedfdgdhdjdk", task.Marker)
+	require.Equal(t, "98", task.Result)
+}
+
+func TestDynamicAccountTestTaskValidatesMarkerAndResult(t *testing.T) {
+	task := fixedDynamicAccountTestTask()
+	require.NoError(t, task.validate("The fixture-marker check result is 42."))
+	require.Error(t, task.validate("The connection is reachable."))
+	require.Error(t, task.validate("fixture-marker result 41"))
+	require.Error(t, task.validate(task.Prompt))
 }
 
 func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsPath(t *testing.T) {
@@ -460,7 +492,7 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsP
 	ctx, recorder := newTestContext()
 
 	upstreamBody := strings.Join([]string{
-		`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"pong"},"finish_reason":null}]}`,
+		`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"pong fixture-marker 42"},"finish_reason":null}]}`,
 		"",
 		`data: {"id":"chatcmpl_test","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
 		"",
@@ -474,6 +506,7 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsP
 	}}
 	svc := &AccountTestService{
 		httpUpstream: upstream,
+		newDynamicOpenAITask: fixedDynamicAccountTestTaskFactory,
 		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
 	}
 	account := &Account{
@@ -497,7 +530,10 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsP
 	require.Equal(t, "text/event-stream", upstream.lastReq.Header.Get("Accept"))
 	require.Equal(t, "gpt-5.4", gjson.GetBytes(upstream.lastBody, "model").String())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
-	require.Equal(t, "hello", gjson.GetBytes(upstream.lastBody, "messages.0.content").String())
+	prompt := gjson.GetBytes(upstream.lastBody, "messages.0.content").String()
+	require.Contains(t, prompt, "fixture-marker")
+	require.Contains(t, prompt, "add 20 and 22")
+	require.NotContains(t, prompt, "42")
 	require.False(t, gjson.GetBytes(upstream.lastBody, "input").Exists())
 	body := recorder.Body.String()
 	require.Contains(t, body, "pong")
