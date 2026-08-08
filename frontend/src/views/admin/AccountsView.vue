@@ -347,6 +347,14 @@
               </div>
             </div>
           </template>
+          <template #cell-model_config="{ row }">
+            <span
+              class="block max-w-[18rem] truncate text-sm text-gray-700 dark:text-gray-300"
+              :title="formatAccountModels(row)"
+            >
+              {{ formatAccountModels(row) }}
+            </span>
+          </template>
           <template #cell-rate_multiplier="{ row }">
             <span class="inline-flex items-center gap-1 text-sm font-mono text-gray-700 dark:text-gray-300">
               <span>{{ formatMultiplier(row.rate_multiplier ?? 1) }}x</span>
@@ -532,6 +540,7 @@ import { extractApiErrorMessage } from '@/utils/apiError'
 import { sanitizeUrl } from '@/utils/url'
 import { getFloatingPanelPosition } from '@/utils/floatingPanel'
 import { formatMultiplier } from '@/utils/formatters'
+import { splitModelMappingObject } from '@/composables/useModelWhitelist'
 import type { Account, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
 
 const { t } = useI18n()
@@ -1629,6 +1638,34 @@ function accountHomepageUrl(row: Account): string {
   return baseUrl ? new URL(baseUrl).origin : ''
 }
 
+function formatAccountModels(row: Account): string {
+  if (row.platform === 'openai') {
+    const extra = (row.extra || {}) as Record<string, unknown>
+    const passthrough = typeof extra.openai_passthrough === 'boolean'
+      ? extra.openai_passthrough
+      : extra.openai_oauth_passthrough === true
+    if (passthrough) return t('admin.accounts.openai.modelRestrictionDisabledByPassthrough')
+  }
+
+  const rawMapping = row.credentials?.model_mapping
+  if (rawMapping && typeof rawMapping === 'object' && !Array.isArray(rawMapping)) {
+    const { allowedModels, modelMappings } = splitModelMappingObject(rawMapping as Record<string, unknown>)
+    const entries = [
+      ...allowedModels,
+      ...modelMappings.map(({ from, to }) => `${from} -> ${to}`)
+    ].sort((left, right) => left.localeCompare(right))
+    if (entries.length > 0) return entries.join(', ')
+  }
+
+  const legacy = row.credentials?.model_whitelist
+  if (Array.isArray(legacy)) {
+    const entries = [...new Set(legacy.map(String).map(value => value.trim()).filter(Boolean))].sort()
+    if (entries.length > 0) return entries.join(', ')
+  }
+
+  return t('admin.accounts.supportsAllModels')
+}
+
 type OpenAICompactBadgeState = 'active' | 'blocked' | 'auto'
 
 function getOpenAICompactState(row: any): OpenAICompactBadgeState | null {
@@ -1704,6 +1741,7 @@ const allColumns = computed(() => {
   c.push({ key: 'usage', label: t('admin.accounts.columns.usageWindows'), sortable: false })
   c.push(
     { key: 'proxy', label: t('admin.accounts.columns.proxy'), sortable: false },
+    { key: 'model_config', label: t('admin.accounts.columns.models'), sortable: false },
     { key: 'priority', label: t('admin.accounts.columns.priority'), sortable: true },
     { key: 'scheduler_score', label: t('admin.accounts.columns.schedulerScore'), sortable: false },
     { key: 'rate_multiplier', label: t('admin.accounts.columns.billingRateMultiplier'), sortable: true },
