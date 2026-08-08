@@ -75,6 +75,7 @@ type AccountTestService struct {
 	tlsFPProfileService       *TLSFingerprintProfileService
 	agentIdentityTaskMu       sync.Mutex
 	agentIdentityWS           agentIdentityWSConnectionInvalidator
+	newDynamicOpenAITask      func() (dynamicAccountTestTask, error)
 }
 
 // NewAccountTestService creates a new AccountTestService
@@ -97,7 +98,15 @@ func NewAccountTestService(
 		httpUpstream:              httpUpstream,
 		cfg:                       cfg,
 		tlsFPProfileService:       tlsFPProfileService,
+		newDynamicOpenAITask:      newDynamicAccountTestTask,
 	}
+}
+
+func (s *AccountTestService) createDynamicOpenAITask() (dynamicAccountTestTask, error) {
+	if s.newDynamicOpenAITask != nil {
+		return s.newDynamicOpenAITask()
+	}
+	return newDynamicAccountTestTask()
 }
 
 func (s *AccountTestService) validateUpstreamBaseURL(raw string) (string, error) {
@@ -545,6 +554,12 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		return s.testOpenAIImageOAuth(c, ctx, account, testModelID, imagePrompt)
 	}
 
+	dynamicTask, err := s.createDynamicOpenAITask()
+	if err != nil {
+		return s.sendErrorAndEnd(c, fmt.Sprintf("Failed to create dynamic test prompt: %s", err.Error()))
+	}
+	prompt = dynamicTask.Prompt
+
 	credentialAccount := account
 	if account.IsCredentialShadow() {
 		resolved, err := resolveCredentialAccount(ctx, s.accountRepo, account)
@@ -587,7 +602,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Invalid base URL: %s", err.Error()))
 		}
 		if !openai_compat.ShouldUseResponsesAPI(account.Extra) {
-			return s.testOpenAIChatCompletionsConnection(c, account, testModelID, prompt, normalizedBaseURL, authToken)
+			return s.testOpenAIChatCompletionsConnection(c, account, testModelID, dynamicTask, normalizedBaseURL, authToken)
 		}
 		apiURL = buildOpenAIResponsesURL(normalizedBaseURL)
 	} else {
@@ -607,7 +622,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	if isOAuth {
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
-	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth)
+	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth, prompt)
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -703,7 +718,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	}
 
 	// Process SSE stream
-	return s.processOpenAIStream(c, resp.Body)
+	return s.processOpenAIStream(c, resp.Body, dynamicTask)
 }
 
 // testGrokAccountConnection tests a Grok OAuth or API-key account through xAI's Responses API.
@@ -831,7 +846,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 	c *gin.Context,
 	account *Account,
 	testModelID string,
-	prompt string,
+	task dynamicAccountTestTask,
 	normalizedBaseURL string,
 	authToken string,
 ) error {
@@ -844,7 +859,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 	c.Writer.Header().Set("X-Accel-Buffering", "no")
 	c.Writer.Flush()
 
-	payload := createOpenAIChatCompletionsTestPayload(testModelID, prompt)
+	payload := createOpenAIChatCompletionsTestPayload(testModelID, task.Prompt)
 	payloadBytes, _ := json.Marshal(payload)
 
 	s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
@@ -885,7 +900,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Chat Completions API (/v1/chat/completions) returned %d: %s", resp.StatusCode, string(body)))
 	}
 
-	return s.processOpenAIChatCompletionsStream(c, resp.Body)
+	return s.processOpenAIChatCompletionsStream(c, resp.Body, task)
 }
 
 // testOpenAICompactConnection probes /responses/compact and persists the
@@ -1455,7 +1470,13 @@ func (s *AccountTestService) processGeminiStream(c *gin.Context, body io.Reader)
 }
 
 // createOpenAITestPayload creates a test payload for OpenAI Responses API
-func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
+func createOpenAITestPayload(modelID string, isOAuth bool, prompts ...string) map[string]any {
+	prompt := "hi"
+	dynamic := false
+	if len(prompts) > 0 && strings.TrimSpace(prompts[0]) != "" {
+		prompt = strings.TrimSpace(prompts[0])
+		dynamic = true
+	}
 	payload := map[string]any{
 		"model": modelID,
 		"input": []map[string]any{
@@ -1464,12 +1485,15 @@ func createOpenAITestPayload(modelID string, isOAuth bool) map[string]any {
 				"content": []map[string]any{
 					{
 						"type": "input_text",
-						"text": "hi",
+						"text": prompt,
 					},
 				},
 			},
 		},
 		"stream": true,
+	}
+	if dynamic {
+		payload["max_output_tokens"] = 128
 	}
 
 	// OAuth accounts using ChatGPT internal API require store: false
@@ -1557,19 +1581,28 @@ func (s *AccountTestService) processClaudeStream(c *gin.Context, body io.Reader)
 
 // processOpenAIChatCompletionsStream processes SSE chunks from the
 // OpenAI-compatible Chat Completions API.
-func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, body io.Reader) error {
+func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, body io.Reader, tasks ...dynamicAccountTestTask) error {
 	reader := bufio.NewReader(body)
 	seenJSON := false
 	seenFinish := false
+	var output strings.Builder
+	finish := func() error {
+		if len(tasks) > 0 {
+			if err := tasks[0].validate(output.String()); err != nil {
+				return s.sendErrorAndEnd(c, err.Error())
+			}
+		}
+		s.sendEvent(c, TestEvent{Type: "status", Text: "已通过 /v1/chat/completions 验证"})
+		s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+		return nil
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				if seenFinish {
-					s.sendEvent(c, TestEvent{Type: "status", Text: "已通过 /v1/chat/completions 验证"})
-					s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
-					return nil
+					return finish()
 				}
 				if seenJSON {
 					return s.sendErrorAndEnd(c, "Chat Completions stream from /v1/chat/completions ended before [DONE]")
@@ -1586,9 +1619,7 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 
 		jsonStr := sseDataPrefix.ReplaceAllString(line, "")
 		if jsonStr == "[DONE]" {
-			s.sendEvent(c, TestEvent{Type: "status", Text: "已通过 /v1/chat/completions 验证"})
-			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
-			return nil
+			return finish()
 		}
 
 		var data map[string]any
@@ -1616,11 +1647,13 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 			}
 			if delta, ok := choice["delta"].(map[string]any); ok {
 				if text, ok := delta["content"].(string); ok && text != "" {
+					_, _ = output.WriteString(text)
 					s.sendEvent(c, TestEvent{Type: "content", Text: text})
 				}
 			}
 			if message, ok := choice["message"].(map[string]any); ok {
 				if text, ok := message["content"].(string); ok && text != "" {
+					_, _ = output.WriteString(text)
 					s.sendEvent(c, TestEvent{Type: "content", Text: text})
 				}
 			}
@@ -1632,17 +1665,26 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 }
 
 // processOpenAIStream processes the SSE stream from OpenAI Responses API
-func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader) error {
+func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader, tasks ...dynamicAccountTestTask) error {
 	reader := bufio.NewReader(body)
 	seenCompleted := false
+	var output strings.Builder
+	finish := func() error {
+		if len(tasks) > 0 {
+			if err := tasks[0].validate(output.String()); err != nil {
+				return s.sendErrorAndEnd(c, err.Error())
+			}
+		}
+		s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
+		return nil
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
 			if err == io.EOF {
 				if seenCompleted {
-					s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
-					return nil
+					return finish()
 				}
 				return s.sendErrorAndEnd(c, "Stream ended before response.completed")
 			}
@@ -1657,8 +1699,7 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 		jsonStr := sseDataPrefix.ReplaceAllString(line, "")
 		if jsonStr == "[DONE]" {
 			if seenCompleted {
-				s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
-				return nil
+				return finish()
 			}
 			return s.sendErrorAndEnd(c, "Stream ended before response.completed")
 		}
@@ -1674,11 +1715,11 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 		case "response.output_text.delta":
 			// OpenAI Responses API uses "delta" field for text content
 			if delta, ok := data["delta"].(string); ok && delta != "" {
+				_, _ = output.WriteString(delta)
 				s.sendEvent(c, TestEvent{Type: "content", Text: delta})
 			}
 		case "response.completed", "response.done":
-			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
-			return nil
+			return finish()
 		case "response.failed":
 			errorMsg := "OpenAI response failed"
 			if responseData, ok := data["response"].(map[string]any); ok {
