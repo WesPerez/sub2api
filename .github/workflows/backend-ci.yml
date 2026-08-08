@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
+    branches-ignore:
+      - mine
+      - debug
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -11,7 +15,7 @@ jobs:
   shell:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Check deployment scripts
         run: |
           /bin/bash -n deploy/apple-container.sh
@@ -19,12 +23,16 @@ jobs:
           /bin/sh deploy/tests/docker-compose-security-test.sh
           /bin/sh deploy/tests/docker-runtime-resources-test.sh
           /bin/sh deploy/test-caddyfile-cache.sh
+          /bin/bash -n deploy/tests/workflow-release-contract-test.sh
+          /bin/bash deploy/tests/workflow-release-contract-test.sh
+          /bin/bash -n deploy/tests/verify-image-provenance-test.sh
+          /bin/bash deploy/tests/verify-image-provenance-test.sh
 
-  test:
+  test-unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: backend/go.mod
           check-latest: false
@@ -36,20 +44,48 @@ jobs:
       - name: Unit tests
         working-directory: backend
         run: make test-unit
+
+  test-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+      - name: Verify Go version
+        run: |
+          go version | grep -q 'go1.26.6'
       - name: Integration tests
         working-directory: backend
         run: make test-integration
 
+  # Preserve the historical required-check name while the two suites run in parallel.
+  test:
+    if: always()
+    needs: [test-unit, test-integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both backend test suites
+        env:
+          UNIT_RESULT: ${{ needs.test-unit.result }}
+          INTEGRATION_RESULT: ${{ needs.test-integration.result }}
+        run: |
+          test "${UNIT_RESULT}" = success
+          test "${INTEGRATION_RESULT}" = success
+
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: '20'
           cache: 'pnpm'
@@ -63,8 +99,8 @@ jobs:
   golangci-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version-file: backend/go.mod
           check-latest: false
@@ -74,8 +110,9 @@ jobs:
         run: |
           go version | grep -q 'go1.26.6'
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.9
-          args: --timeout=30m
+          args: --timeout=30m --max-same-issues=0 --max-issues-per-linter=0
+          skip-cache: true
           working-directory: backend
