@@ -5,6 +5,7 @@ package repository
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
@@ -414,21 +415,47 @@ func TestProxyIdentityUpdateInvalidatesProbeAndRejectsInFlightSnapshot(t *testin
 			)
 			require.NoError(t, rows.Scan(&outboxCount, &payloadJSON))
 			require.NoError(t, rows.Close())
-			if tt.wantInvalidation {
-				require.Equal(t, 1, outboxCount)
-				var payload struct {
-					AccountIDs []int64 `json:"account_ids"`
-				}
-				require.NoError(t, json.Unmarshal([]byte(payloadJSON), &payload))
-				require.Equal(t, []int64{account.ID}, payload.AccountIDs)
-			} else {
-				require.Zero(t, outboxCount, "no snapshot change means no PR2 cache invalidation event")
+			require.Equal(t, 1, outboxCount, "a proxy identity change must invalidate every bound scheduler snapshot")
+			var payload struct {
+				AccountIDs []int64 `json:"account_ids"`
 			}
+			require.NoError(t, json.Unmarshal([]byte(payloadJSON), &payload))
+			require.Equal(t, []int64{account.ID}, payload.AccountIDs)
 		})
 	}
 }
 
-func TestSweepExpiredProxyWithoutFallbackInvalidatesOnlyExistingProbeSnapshot(t *testing.T) {
+func TestProbeSnapshotCASAcceptsHydratedAccountBoundProxyIdentity(t *testing.T) {
+	ctx := context.Background()
+	tx := testEntTx(t)
+	accountRepo := newAccountRepositoryWithSQL(tx.Client(), tx, nil)
+	proxy := mustCreateProxy(t, tx.Client(), &service.Proxy{
+		Name:     "templated-probe-proxy",
+		Protocol: "http",
+		Host:     "proxy.example",
+		Port:     8080,
+		Username: "resin-{{account_id}}",
+		Password: "fixture-password",
+		Status:   service.StatusActive,
+	})
+	account := mustCreateAccount(t, tx.Client(), &service.Account{
+		Name:        "templated-probe-account",
+		Platform:    service.PlatformOpenAI,
+		Type:        service.AccountTypeAPIKey,
+		Credentials: map[string]any{"api_key": "sk-test"},
+		Extra:       map[string]any{service.UpstreamBillingProbeEnabledExtraKey: true},
+		ProxyID:     &proxy.ID,
+	})
+
+	inFlight, err := accountRepo.GetByID(ctx, account.ID)
+	require.NoError(t, err)
+	require.Equal(t, "resin-"+strconv.FormatInt(account.ID, 10), inFlight.Proxy.Username)
+	require.NoError(t, accountRepo.UpdateUpstreamBillingProbeSnapshot(ctx, inFlight, &service.UpstreamBillingProbeSnapshot{
+		Status: service.UpstreamBillingProbeStatusOK, LastAttemptAt: time.Now().UTC(),
+	}, nil))
+}
+
+func TestSweepExpiredProxyWithoutFallbackInvalidatesAllBoundSchedulerSnapshots(t *testing.T) {
 	ctx := context.Background()
 	tx := testEntTx(t)
 	proxyRepo := newProxyRepositoryWithSQL(tx.Client(), tx)
@@ -483,7 +510,7 @@ func TestSweepExpiredProxyWithoutFallbackInvalidatesOnlyExistingProbeSnapshot(t 
 	}
 
 	payload := latestBulkAccountOutboxPayload(t, ctx, tx)
-	require.Equal(t, []int64{withSnapshot.ID}, payload)
+	require.Equal(t, []int64{withSnapshot.ID, withoutSnapshot.ID, withJSONNull.ID}, payload)
 }
 
 func TestSweepExpiredProxyFallbackRerouteDeletesProbeSnapshot(t *testing.T) {
