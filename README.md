@@ -904,3 +904,8 @@ Copyright (c) 2026 Wesley Liddick
 **If you find this project useful, please give it a star!**
 
 </div>
+
+
+## 生产服务器发布约束
+
+本服务器禁止下载或安装项目依赖、编译、构建及构造镜像；源码审查后推送 GitHub，由 GitHub-hosted CI 完成验证与构建。服务器只拉取通过验证的镜像或发布包。具体发布入口、数据保护、日志保留和工作树收尾规则见 [AGENTS.md](AGENTS.md)。
