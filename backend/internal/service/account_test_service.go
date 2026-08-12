@@ -693,6 +693,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		upstreamTestModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
 	payload := createOpenAITestPayload(upstreamTestModelID, isOAuth)
+	if isSharedChatCodexPassthrough(credentialAccount) {
+		payload["client_metadata"] = map[string]any{"x-codex-installation-id": resolveConvergedInstallationID(credentialAccount)}
+	}
 	payloadBytes, _ := json.Marshal(payload)
 
 	// Send test_start event once. A task-invalid Agent Identity response may
@@ -768,6 +771,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if isSharedChatCodexPassthrough(credentialAccount) {
+			normalizeSharedChatQuotaResponse(resp, body, time.Now())
+		}
 		body = redactAgentIdentitySensitiveBodyForAccount(ctx, s.accountRepo, credentialAccount, body)
 		if !agentIdentityTaskRecoveryWasTried(ctx) && credentialAccount.IsOpenAIAgentIdentity() && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, body) {
 			expectedTaskID := credentialAccount.GetCredential("task_id")
@@ -2172,9 +2178,15 @@ func (s *AccountTestService) reconcileOpenAI429State(ctx context.Context, accoun
 	account.RateLimitResetAt = resetAt
 
 	if account.Status == StatusError {
+		if !account.Schedulable {
+			if err := s.accountRepo.SetSchedulable(ctx, account.ID, true); err != nil {
+				return
+			}
+		}
 		if err := s.accountRepo.ClearError(ctx, account.ID); err != nil {
 			return
 		}
+		account.Schedulable = true
 		account.Status = StatusActive
 		account.ErrorMessage = ""
 	}

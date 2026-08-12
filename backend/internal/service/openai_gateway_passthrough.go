@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -115,6 +116,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	reqStream bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
+	sharedChat := isSharedChatCodexPassthrough(account)
 	upstreamPassthroughModel := ""
 	if isOpenAIResponsesCompactPath(c) {
 		compactMappedModel := resolveOpenAICompactForwardModel(account, reqModel)
@@ -191,6 +193,18 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		}
 		body = adaptedBody
 		c.Set(openAIResponsesClientToolMappingContextKey, mapping)
+	}
+	if sharedChat && !reqStream && !isOpenAIResponsesCompactPath(c) {
+		nextBody, setErr := sjson.SetBytes(body, "stream", true)
+		if setErr != nil {
+			return nil, fmt.Errorf("enable SharedChat upstream streaming: %w", setErr)
+		}
+		body = nextBody
+	}
+	if sharedChat && strings.TrimSpace(gjson.GetBytes(body, "client_metadata.x-codex-installation-id").String()) == "" {
+		if installationID := resolveConvergedInstallationID(account); installationID != "" {
+			body, _ = sjson.SetBytes(body, "client_metadata.x-codex-installation-id", installationID)
+		}
 	}
 
 	sanitizedBody, sanitized, err := sanitizeEmptyBase64InputImagesInOpenAIBody(body)
@@ -329,6 +343,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		probeBody := s.readUpstreamErrorBody(resp)
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(probeBody))
+		if sharedChat {
+			normalizeSharedChatQuotaResponse(resp, probeBody, time.Now())
+		}
 		if !agentTaskRecoveryTried && s.isAgentIdentityAccount(ctx, account) && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, probeBody) {
 			agentTaskRecoveryTried = true
 			expectedTaskID := account.GetCredential("task_id")
@@ -465,6 +482,7 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	body []byte,
 	token string,
 ) (*http.Request, error) {
+	sharedChat := isSharedChatCodexPassthrough(account)
 	targetURL := openaiPlatformAPIURL
 	switch account.Type {
 	case AccountTypeOAuth:
@@ -598,10 +616,62 @@ func (s *OpenAIGatewayService) buildUpstreamRequestOpenAIPassthrough(
 	// x-codex-beta-features：按真实 Codex 的会话级行为补注（在账号级覆写之后，
 	// 保证不被覆盖丢失）。
 	applyOpenAICodexBetaFeatures(c, account, req.Header)
+	if sharedChat {
+		ensureCodexIdentityHeaders(req.Header)
+		enforceCodexIdentityHeaders(req.Header)
+		if isOpenAIResponsesCompactPath(c) {
+			req.Header.Set("accept", "application/json")
+		} else {
+			req.Header.Set("accept", "text/event-stream")
+		}
+	}
 	setOpenAICodexRoutingHintFromBody(req.Header, account, body)
 	logOpenAIRoutingDiagnosticsFromBody(ctx, account, "http_passthrough", req.Header, body, "not_applicable")
 
 	return req, nil
+}
+
+func isSharedChatCodexPassthrough(account *Account) bool {
+	if account == nil || account.Platform != PlatformOpenAI || account.Type != AccountTypeAPIKey || !account.IsOpenAIPassthroughEnabled() {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(account.GetOpenAIBaseURL()))
+	if err != nil || !strings.EqualFold(parsed.Hostname(), "new.sharedchat.cc") {
+		return false
+	}
+	path := strings.TrimRight(parsed.Path, "/")
+	return path == "/codex" || path == "/codex/responses"
+}
+
+func normalizeSharedChatQuotaResponse(resp *http.Response, body []byte, now time.Time) {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	daily := strings.EqualFold(code, "global_daily_quota_exhausted")
+	if resp == nil || resp.StatusCode != http.StatusForbidden ||
+		(!daily && !strings.EqualFold(code, "global_fixed_window_quota_exhausted")) {
+		return
+	}
+	local := now.In(time.FixedZone("CST", 8*60*60))
+	nextHour := (local.Hour()/3 + 1) * 3
+	resetDay := local
+	if daily {
+		resetDay = local.AddDate(0, 0, 1)
+		nextHour = 0
+	} else if nextHour == 24 {
+		resetDay = local.AddDate(0, 0, 1)
+		nextHour = 0
+	}
+	resetAt := time.Date(resetDay.Year(), resetDay.Month(), resetDay.Day(), nextHour, 0, 0, 0, local.Location())
+	resetAfter := max(1, int((resetAt.Sub(local)+time.Second-1)/time.Second))
+	resp.StatusCode = http.StatusTooManyRequests
+	resp.Status = fmt.Sprintf("%d %s", http.StatusTooManyRequests, http.StatusText(http.StatusTooManyRequests))
+	resp.Header.Set("Retry-After", strconv.Itoa(resetAfter))
+	resp.Header.Set("X-Codex-Primary-Used-Percent", "100")
+	resp.Header.Set("X-Codex-Primary-Reset-After-Seconds", strconv.Itoa(resetAfter))
+	if daily {
+		resp.Header.Set("X-Codex-Primary-Window-Minutes", "1440")
+	} else {
+		resp.Header.Set("X-Codex-Primary-Window-Minutes", "180")
+	}
 }
 
 func stripOpenAILegacyResponsesBeta(headers http.Header) {
@@ -1737,6 +1807,7 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 		}
 	}
 	if !writeOpenAICompactSSEBridge(c, resp.StatusCode, body) {
+		c.Writer.Header().Set("Content-Type", contentType)
 		c.Data(resp.StatusCode, contentType, body)
 	}
 

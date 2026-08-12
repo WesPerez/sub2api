@@ -14,6 +14,13 @@ func buildOpenAIEndpointURL(base string, endpoint string) string {
 		return strings.TrimRight(normalized, "/") + endpoint
 	}
 	path := strings.TrimRight(parsed.Path, "/")
+	if endpoint == "/v1/responses" && strings.EqualFold(parsed.Hostname(), "new.sharedchat.cc") && path == "/codex" {
+		path += "/responses"
+		parsed.Path = path
+		parsed.RawPath = ""
+		parsed.Fragment = ""
+		return parsed.String()
+	}
 	if !strings.HasSuffix(path, endpoint) && !strings.HasSuffix(path, relative) {
 		if openAIBaseURLHasVersionSuffix(path) {
 			path += relative

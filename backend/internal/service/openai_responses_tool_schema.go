@@ -1,7 +1,6 @@
 package service
 
 import (
-	"bytes"
 	"sort"
 
 	"github.com/tidwall/gjson"
@@ -117,10 +116,11 @@ func appendOpenAIResponsesToolSchemaNullType(
 	body []byte, typ gjson.Result, hits *[]openAIResponsesToolSchemaNullType,
 ) {
 	end := typ.Index + len(typ.Raw)
-	if typ.Index <= 0 || end > len(body) {
+	if typ.Index <= 0 || len(typ.Raw) != len(openAIResponsesToolSchemaNullLiteral) || end > len(body) {
 		return
 	}
-	if !bytes.Equal(body[typ.Index:end], []byte(typ.Raw)) {
+	if body[typ.Index] != 'n' || body[typ.Index+1] != 'u' ||
+		body[typ.Index+2] != 'l' || body[typ.Index+3] != 'l' {
 		return
 	}
 	*hits = append(*hits, openAIResponsesToolSchemaNullType{offset: typ.Index, length: len(typ.Raw)})
