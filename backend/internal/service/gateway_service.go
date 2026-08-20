@@ -1391,6 +1391,15 @@ func (s *GatewayService) GetAvailableModels(ctx context.Context, groupID *int64,
 		}
 
 		mapping := acc.GetModelMapping()
+		// Antigravity expands explicit mappings with compatibility passthroughs at
+		// runtime. Those aliases keep legacy requests working, but they are not
+		// models the operator selected for this account and must not leak into the
+		// public /v1/models catalog consumed by Router policy discovery.
+		if acc.Platform == PlatformAntigravity && acc.Credentials != nil {
+			if configured := stringMappingFromRaw(acc.Credentials["model_mapping"]); len(configured) > 0 {
+				mapping = configured
+			}
+		}
 		if len(mapping) > 0 {
 			hasAnyMapping = true
 			for model := range mapping {

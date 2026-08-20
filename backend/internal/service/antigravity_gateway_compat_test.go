@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
@@ -342,6 +343,110 @@ func TestAntigravityCompatRoutesByMappedModelFamily(t *testing.T) {
 			require.Equal(t, tt.wantSessionID, gjson.GetBytes(upstream.requestBodies[0], "request.sessionId").Exists())
 		})
 	}
+}
+
+func TestAntigravityCompatResponsesDirectGeminiWire(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &queuedHTTPUpstreamStub{responses: []*http.Response{antigravityCompatSuccessResponse()}}
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
+	body := []byte(`{"model":"gemini-3.7-flash","stream":true,"instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"inspect"},{"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]}`)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses", body)
+	account := newAntigravityCompatAccount(AccountTypeOAuth)
+	account.Credentials["model_mapping"] = map[string]any{"gemini-3.7-flash": "gemini-3.7-flash-high"}
+
+	result, err := svc.ForwardAsResponses(context.Background(), c, account, body, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Len(t, upstream.requestBodies, 1)
+	wire := upstream.requestBodies[0]
+	require.Equal(t, "gemini-3.7-flash-tiered", gjson.GetBytes(wire, "model").String())
+	require.Equal(t, "inspect", gjson.GetBytes(wire, "request.contents.0.parts.0.text").String())
+	require.Equal(t, "image/png", gjson.GetBytes(wire, "request.contents.0.parts.1.inlineData.mimeType").String())
+	require.Equal(t, int64(32768), gjson.GetBytes(wire, "request.generationConfig.maxOutputTokens").Int())
+	require.Equal(t, "high", gjson.GetBytes(wire, "request.generationConfig.thinkingConfig.thinkingLevel").String())
+	require.True(t, gjson.GetBytes(wire, "request.generationConfig.thinkingConfig.includeThoughts").Bool())
+	require.False(t, gjson.GetBytes(wire, "request.messages").Exists())
+}
+
+func TestAntigravityCompatResponsesClaudeKeepsLegacyCompatibilityPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &queuedHTTPUpstreamStub{responses: []*http.Response{antigravityCompatSuccessResponse()}}
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
+	body := []byte(`{"model":"claude-sonnet-4-5","stream":false,"input":"inspect"}`)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses", body)
+	account := newAntigravityCompatAccount(AccountTypeOAuth)
+	account.Credentials["model_mapping"] = map[string]any{"claude-sonnet-4-5": "claude-sonnet-4-5"}
+
+	result, err := svc.ForwardAsResponses(context.Background(), c, account, body, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Contains(t, recorder.Body.String(), `"status":"completed"`)
+	require.Len(t, upstream.requestBodies, 1)
+	require.Equal(t, "claude-sonnet-4-5", gjson.GetBytes(upstream.requestBodies[0], "model").String())
+}
+
+func TestAntigravityCompatResponsesDirectRejectsCompaction(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &queuedHTTPUpstreamStub{}
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, upstream)
+	body := []byte(`{"model":"gemini-3.7-flash","stream":true,"input":[{"type":"compaction_trigger"}]}`)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses/compact", body)
+	account := newAntigravityCompatAccount(AccountTypeOAuth)
+	account.Credentials["model_mapping"] = map[string]any{"gemini-3.7-flash": "gemini-3.7-flash-high"}
+
+	result, err := svc.ForwardAsResponses(context.Background(), c, account, body, nil)
+	require.Nil(t, result)
+	require.Error(t, err)
+	require.Equal(t, http.StatusBadRequest, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "does not support Responses compaction")
+	require.Empty(t, upstream.requestBodies)
+}
+
+func TestAntigravityCompatResponsesDirectStreamDoesNotCompleteWithoutFinishReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, nil)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"response":{"responseId":"resp_incomplete","candidates":[{"content":{"parts":[{"text":"partial"}]}}]}}` + "\n\n",
+		)),
+	}
+
+	result, err := svc.handleResponsesStreamingDirectFromAntigravity(
+		c, resp, time.Now(), "gemini-3.7-flash", apicompat.ResponsesClientToolMapping{},
+	)
+
+	require.ErrorContains(t, err, "without finishReason")
+	require.NotNil(t, result)
+	require.NotContains(t, recorder.Body.String(), `"type":"response.completed"`)
+	require.Contains(t, recorder.Body.String(), `"type":"stream_read_error"`)
+}
+
+func TestAntigravityCompatResponsesDirectNonStreamRetriesWithoutFinishReason(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newAntigravityCompatService(config.GatewayConfig{MaxLineSize: defaultMaxLineSize}, nil)
+	c, recorder := newAntigravityCompatContext(http.MethodPost, "/v1/responses", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			`data: {"response":{"responseId":"resp_incomplete","candidates":[{"content":{"parts":[{"text":"partial"}]}}]}}` + "\n\n",
+		)),
+	}
+
+	result, err := svc.handleResponsesNonStreamingDirectFromAntigravity(
+		c, resp, time.Now(), "gemini-3.7-flash", apicompat.ResponsesClientToolMapping{},
+	)
+
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.ErrorAs(t, err, &failoverErr)
+	require.True(t, failoverErr.RetryableOnSameAccount)
+	require.Empty(t, recorder.Body.String())
 }
 
 func TestAntigravityCompatUnauthorizedIsCredentialFailure(t *testing.T) {

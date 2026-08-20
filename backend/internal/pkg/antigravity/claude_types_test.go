@@ -25,6 +25,7 @@ func TestDefaultModels_ContainsNewAndLegacyImageModels(t *testing.T) {
 		"gemini-3.6-flash-low",
 		"gemini-3.6-flash-medium",
 		"gemini-3.6-flash-tiered",
+		"gemini-3.7-flash",
 	}
 
 	for _, id := range requiredIDs {

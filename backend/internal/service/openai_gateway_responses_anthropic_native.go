@@ -43,8 +43,8 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 ) (*OpenAIForwardResult, error) {
 	startTime := time.Now()
 
-	// 1. Lower Codex client-side tools to function tools understood by Anthropic.
-	adaptedBody, clientToolMapping, err := adaptResponsesClientToolsForAnthropic(body)
+	// 1. Lower Codex client-side tools to portable function declarations.
+	adaptedBody, clientToolMapping, err := adaptResponsesClientToolsForGateway(body)
 	if err != nil {
 		writeResponsesError(c, http.StatusBadRequest, "invalid_request_error", "Failed to adapt request tools")
 		return nil, fmt.Errorf("adapt responses client tools: %w", err)

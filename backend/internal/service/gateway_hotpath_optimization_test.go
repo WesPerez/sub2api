@@ -693,6 +693,32 @@ func TestGetAvailableModels_GlobalListPreservesMappedModelsWithOpenAIPassthrough
 	require.Equal(t, []string{"claude-mapped"}, svc.GetAvailableModels(context.Background(), &groupID, ""))
 }
 
+func TestGetAvailableModels_AntigravityCatalogUsesExplicitMappingKeys(t *testing.T) {
+	groupID := int64(12)
+	account := Account{
+		ID:       1,
+		Platform: PlatformAntigravity,
+		Credentials: map[string]any{
+			"model_mapping": map[string]any{
+				"gemini-3.7-flash": "gemini-3.7-flash-high",
+			},
+		},
+	}
+
+	// Runtime compatibility still accepts legacy passthroughs.
+	runtimeMapping := account.GetModelMapping()
+	require.Equal(t, "gemini-3.6-flash", runtimeMapping["gemini-3.6-flash"])
+
+	repo := &modelsListAccountRepoStub{byGroup: map[int64][]Account{groupID: {account}}}
+	svc := &GatewayService{
+		accountRepo:        repo,
+		modelsListCache:    gocache.New(time.Minute, time.Minute),
+		modelsListCacheTTL: time.Minute,
+	}
+
+	require.Equal(t, []string{"gemini-3.7-flash"}, svc.GetAvailableModels(context.Background(), &groupID, PlatformAntigravity))
+}
+
 func TestGatewayHotpathHelpers_CacheTTLAndStickyContext(t *testing.T) {
 	t.Run("resolve_user_group_rate_cache_ttl", func(t *testing.T) {
 		require.Equal(t, defaultUserGroupRateCacheTTL, resolveUserGroupRateCacheTTL(nil))

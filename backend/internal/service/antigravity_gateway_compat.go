@@ -30,19 +30,22 @@ const (
 )
 
 type antigravityCompatRequest struct {
-	protocol        antigravityCompatProtocol
-	originalBody    []byte
-	claudeBody      []byte
-	originalModel   string
-	clientStream    bool
-	includeUsage    bool
-	startTime       time.Time
-	reasoningEffort *string
+	protocol          antigravityCompatProtocol
+	originalBody      []byte
+	claudeBody        []byte
+	responsesBody     []byte
+	originalModel     string
+	clientStream      bool
+	includeUsage      bool
+	startTime         time.Time
+	reasoningEffort   *string
+	clientToolMapping apicompat.ResponsesClientToolMapping
 }
 
 type antigravityCompatUpstreamCall struct {
 	request      antigravityCompatRequest
 	billingModel string
+	directGemini bool
 	prefix       string
 	proxyURL     string
 	accessToken  string
@@ -108,32 +111,29 @@ func (s *AntigravityGatewayService) ForwardAsResponses(
 		return nil, err
 	}
 
+	adaptedBody, clientToolMapping, err := adaptResponsesClientToolsForGateway(body)
+	if err != nil {
+		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+	}
+
 	var request apicompat.ResponsesRequest
-	if json.Unmarshal(body, &request) != nil {
+	if json.Unmarshal(adaptedBody, &request) != nil {
 		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Failed to parse request body")
 	}
 	if strings.TrimSpace(request.Model) == "" {
 		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 	}
 
-	claudeRequest, err := apicompat.ResponsesToAnthropicRequest(&request)
-	if err != nil {
-		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
-	}
-	claudeRequest.Stream = request.Stream
-	claudeBody, err := json.Marshal(claudeRequest)
-	if err != nil {
-		return nil, fmt.Errorf("marshal anthropic request: %w", err)
-	}
-
 	return s.forwardAntigravityCompat(ctx, c, account, antigravityCompatRequest{
-		protocol:        antigravityCompatResponses,
-		originalBody:    body,
-		claudeBody:      claudeBody,
-		originalModel:   request.Model,
-		clientStream:    request.Stream,
-		startTime:       time.Now(),
-		reasoningEffort: ExtractResponsesReasoningEffortFromBody(body),
+		protocol:          antigravityCompatResponses,
+		originalBody:      body,
+		responsesBody:     adaptedBody,
+		claudeBody:        nil,
+		originalModel:     request.Model,
+		clientStream:      request.Stream,
+		startTime:         time.Now(),
+		reasoningEffort:   ExtractResponsesReasoningEffortFromBody(body),
+		clientToolMapping: clientToolMapping,
 	})
 }
 
@@ -205,20 +205,49 @@ func (s *AntigravityGatewayService) prepareAntigravityCompatCall(
 	account *Account,
 	request antigravityCompatRequest,
 ) (*antigravityCompatUpstreamCall, error) {
-	var claudeRequest antigravity.ClaudeRequest
-	if json.Unmarshal(request.claudeBody, &claudeRequest) != nil {
-		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request body")
-	}
-
 	mappedModel := s.getMappedModel(account, request.originalModel)
 	if mappedModel == "" {
 		MarkOpsClientBusinessLimited(c, OpsClientBusinessLimitedReasonLocalFeatureGate)
 		message := fmt.Sprintf("model %s not in whitelist", request.originalModel)
 		return nil, s.writeAntigravityCompatError(c, http.StatusForbidden, "permission_error", message)
 	}
-	thinkingEnabled := claudeRequest.Thinking != nil &&
-		(claudeRequest.Thinking.Type == "enabled" || claudeRequest.Thinking.Type == "adaptive")
-	mappedModel = applyThinkingModelSuffix(mappedModel, thinkingEnabled)
+
+	directGemini := request.protocol == antigravityCompatResponses && strings.HasPrefix(strings.ToLower(strings.TrimSpace(mappedModel)), "gemini-")
+	modelEffort := ""
+	claudeBody := request.claudeBody
+	if directGemini {
+		if IsOpenAIResponsesCompactPath(c) || HasCompactionTriggerInInput(request.originalBody) {
+			return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Gemini Antigravity does not support Responses compaction")
+		}
+		modelEffort = antigravityResponsesModelEffort(mappedModel)
+		if modelEffort == "" {
+			modelEffort = antigravityResponsesModelEffort(request.originalModel)
+		}
+		mappedModel = normalizeAntigravityResponsesModel(mappedModel)
+	} else {
+		if request.protocol == antigravityCompatResponses && len(claudeBody) == 0 {
+			var responsesRequest apicompat.ResponsesRequest
+			if err := json.Unmarshal(request.responsesBody, &responsesRequest); err != nil {
+				return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request body")
+			}
+			claudeRequest, err := apicompat.ResponsesToAnthropicRequest(&responsesRequest)
+			if err != nil {
+				return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+			}
+			claudeRequest.Stream = responsesRequest.Stream
+			claudeBody, err = json.Marshal(claudeRequest)
+			if err != nil {
+				return nil, fmt.Errorf("marshal anthropic request: %w", err)
+			}
+		}
+		var claudeRequest antigravity.ClaudeRequest
+		if json.Unmarshal(claudeBody, &claudeRequest) != nil {
+			return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request body")
+		}
+		thinkingEnabled := claudeRequest.Thinking != nil &&
+			(claudeRequest.Thinking.Type == "enabled" || claudeRequest.Thinking.Type == "adaptive")
+		mappedModel = applyThinkingModelSuffix(mappedModel, thinkingEnabled)
+	}
 
 	if s.tokenProvider == nil {
 		return nil, s.writeAntigravityCompatError(c, http.StatusBadGateway, "api_error", "Antigravity token provider not configured")
@@ -236,20 +265,58 @@ func (s *AntigravityGatewayService) prepareAntigravityCompatCall(
 		_ = s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return nil, err
 	}
-	geminiBody, err := s.buildAntigravityCompatGeminiBody(ctx, request.claudeBody, &claudeRequest, projectID, mappedModel)
-	if err != nil {
-		return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request")
+
+	var geminiBody []byte
+	if directGemini {
+		geminiBody, err = s.buildAntigravityResponsesGeminiBody(request.responsesBody, projectID, mappedModel, modelEffort)
+		if err != nil {
+			return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request")
+		}
+	} else {
+		var claudeRequest antigravity.ClaudeRequest
+		_ = json.Unmarshal(claudeBody, &claudeRequest)
+		geminiBody, err = s.buildAntigravityCompatGeminiBody(ctx, claudeBody, &claudeRequest, projectID, mappedModel)
+		if err != nil {
+			return nil, s.writeAntigravityCompatError(c, http.StatusBadRequest, "invalid_request_error", "Invalid request")
+		}
 	}
 
 	request.reasoningEffort = ApplyThinkingEnabledFallback(request.reasoningEffort, request.originalBody, mappedModel)
+	if directGemini && request.reasoningEffort == nil && modelEffort != "" {
+		effort := modelEffort
+		request.reasoningEffort = &effort
+	}
 	return &antigravityCompatUpstreamCall{
 		request:      request,
 		billingModel: mappedModel,
+		directGemini: directGemini,
 		prefix:       logPrefix(getSessionID(c), account.Name),
 		proxyURL:     antigravityCompatProxyURL(account),
 		accessToken:  accessToken,
 		geminiBody:   geminiBody,
 	}, nil
+}
+
+func normalizeAntigravityResponsesModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	if lower == "gemini-3.7-flash" || lower == "gemini-3.7-flash-tiered" ||
+		lower == "gemini-3.7-flash-low" || lower == "gemini-3.7-flash-medium" || lower == "gemini-3.7-flash-high" {
+		return "gemini-3.7-flash-tiered"
+	}
+	return model
+}
+
+func antigravityResponsesModelEffort(model string) string {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gemini-3.7-flash-low":
+		return "low"
+	case "gemini-3.7-flash-medium":
+		return "medium"
+	case "gemini-3.7-flash-high":
+		return "high"
+	default:
+		return ""
+	}
 }
 
 func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
@@ -282,6 +349,38 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
 	options := s.getClaudeTransformOptions(ctx)
 	options.EnableIdentityPatch = true
 	return antigravity.TransformClaudeToGeminiWithOptions(claudeRequest, projectID, mappedModel, options)
+}
+
+func (s *AntigravityGatewayService) buildAntigravityResponsesGeminiBody(
+	adaptedResponsesBody []byte,
+	projectID string,
+	mappedModel string,
+	defaultEffort string,
+) ([]byte, error) {
+	var req apicompat.ResponsesRequest
+	if err := json.Unmarshal(adaptedResponsesBody, &req); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(defaultEffort) != "" && (req.Reasoning == nil || strings.TrimSpace(req.Reasoning.Effort) == "") {
+		req.Reasoning = &apicompat.ResponsesReasoning{Effort: defaultEffort}
+	}
+	body, err := apicompat.ResponsesToGeminiGenerateContentJSON(&req, mappedModel)
+	if err != nil {
+		return nil, err
+	}
+	body, err = enableMixedGeminiToolInvocations(body)
+	if err != nil {
+		return nil, err
+	}
+	body = ensureGeminiFunctionCallThoughtSignatures(body)
+	body, err = injectIdentityPatchToGeminiRequest(body)
+	if err != nil {
+		return nil, err
+	}
+	if cleaned, cleanErr := cleanGeminiRequest(body); cleanErr == nil {
+		body = cleaned
+	}
+	return s.wrapV1InternalRequest(projectID, mappedModel, body)
 }
 
 func enableMixedGeminiToolInvocations(body []byte) ([]byte, error) {
@@ -390,11 +489,17 @@ func (s *AntigravityGatewayService) consumeAntigravityCompatSuccess(
 				call.request.includeUsage,
 			)
 		}
+		if call.directGemini {
+			return s.handleResponsesStreamingDirectFromAntigravity(c, resp, call.request.startTime, call.request.originalModel, call.request.clientToolMapping)
+		}
 		return s.handleResponsesStreamingFromAntigravity(c, resp, call.request.startTime, call.request.originalModel)
 	}
 
 	if call.request.protocol == antigravityCompatChatCompletions {
 		return s.handleChatCompletionsNonStreamingFromAntigravity(c, resp, call.request.startTime, call.request.originalModel)
+	}
+	if call.directGemini {
+		return s.handleResponsesNonStreamingDirectFromAntigravity(c, resp, call.request.startTime, call.request.originalModel, call.request.clientToolMapping)
 	}
 	return s.handleResponsesNonStreamingFromAntigravity(c, resp, call.request.startTime, call.request.originalModel)
 }
