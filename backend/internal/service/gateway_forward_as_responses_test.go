@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAdaptResponsesClientToolsForAnthropic_FlattensNamespace(t *testing.T) {
+func TestAdaptResponsesClientToolsForGateway_FlattensNamespace(t *testing.T) {
 	t.Parallel()
 
 	body := []byte(`{
@@ -25,7 +25,7 @@ func TestAdaptResponsesClientToolsForAnthropic_FlattensNamespace(t *testing.T) {
 		"tools":[{"type":"namespace","name":"codex_app","tools":[{"type":"function","name":"read_thread","description":"Read a task","parameters":{"type":"object","properties":{}}}]}]
 	}`)
 
-	adapted, mapping, err := adaptResponsesClientToolsForAnthropic(body)
+	adapted, mapping, err := adaptResponsesClientToolsForGateway(body)
 	require.NoError(t, err)
 	require.Equal(t, apicompat.ResponsesNamespaceName{Namespace: "codex_app", Name: "read_thread"}, mapping.NamespaceTools["codex_app__read_thread"])
 
@@ -43,7 +43,7 @@ func TestAdaptResponsesClientToolsForAnthropic_FlattensNamespace(t *testing.T) {
 	require.NotContains(t, call, "namespace")
 }
 
-func TestAdaptResponsesClientToolsForAnthropic_LiftsAdditionalTools(t *testing.T) {
+func TestAdaptResponsesClientToolsForGateway_LiftsAdditionalTools(t *testing.T) {
 	body := []byte(`{
 		"model":"claude-fable-5",
 		"input":[
@@ -57,7 +57,7 @@ func TestAdaptResponsesClientToolsForAnthropic_LiftsAdditionalTools(t *testing.T
 		]
 	}`)
 
-	adapted, mapping, err := adaptResponsesClientToolsForAnthropic(body)
+	adapted, mapping, err := adaptResponsesClientToolsForGateway(body)
 	require.NoError(t, err)
 	require.True(t, mapping.CustomTools["exec"])
 	require.Equal(t, apicompat.ResponsesNamespaceName{Namespace: "codex_app", Name: "read_thread"}, mapping.NamespaceTools["codex_app__read_thread"])

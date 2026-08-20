@@ -78,8 +78,9 @@ type GeminiImageConfig struct {
 
 // GeminiThinkingConfig Gemini thinking 配置
 type GeminiThinkingConfig struct {
-	IncludeThoughts bool `json:"includeThoughts"`
-	ThinkingBudget  int  `json:"thinkingBudget,omitempty"`
+	IncludeThoughts bool   `json:"includeThoughts"`
+	ThinkingBudget  int    `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
 }
 
 // GeminiToolDeclaration Gemini 工具声明
@@ -118,7 +119,8 @@ type GeminiToolConfig struct {
 
 // GeminiFunctionCallingConfig 函数调用配置
 type GeminiFunctionCallingConfig struct {
-	Mode string `json:"mode,omitempty"` // VALIDATED, AUTO, NONE
+	Mode                 string   `json:"mode,omitempty"` // VALIDATED, AUTO, ANY, NONE
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
 }
 
 // GeminiSafetySetting Gemini 安全设置

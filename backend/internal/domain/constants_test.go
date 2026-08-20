@@ -73,6 +73,12 @@ func TestDefaultAntigravityModelMapping_Gemini36FlashModels(t *testing.T) {
 	}
 }
 
+func TestDefaultAntigravityModelMapping_Gemini37FlashUsesTieredWireModel(t *testing.T) {
+	if got := DefaultAntigravityModelMapping["gemini-3.7-flash"]; got != "gemini-3.7-flash-tiered" {
+		t.Fatalf("expected gemini-3.7-flash to map to tiered wire model, got %q", got)
+	}
+}
+
 func TestDefaultBedrockModelMapping_ContainsNewClaudeModels(t *testing.T) {
 	t.Parallel()
 
