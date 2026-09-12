@@ -69,6 +69,56 @@ func requireResponsesClientToolValue[T any](t *testing.T, value any) T {
 	return typed
 }
 
+func TestAdaptResponsesClientTools_PreservesMultimodalCustomToolOutput(t *testing.T) {
+	t.Parallel()
+
+	content := []any{
+		map[string]any{"type": "input_text", "text": "image loaded"},
+		map[string]any{"type": "input_image", "image_url": "data:image/png;base64,YQ=="},
+		map[string]any{"type": "input_file", "file_id": "file_123"},
+	}
+	req := map[string]any{
+		"tools": []any{map[string]any{"type": "custom", "name": "view_image"}},
+		"input": []any{map[string]any{
+			"type": "custom_tool_call_output", "call_id": "call_image", "output": content,
+		}},
+	}
+
+	_, changed, err := AdaptResponsesClientTools(req)
+	require.NoError(t, err)
+	require.True(t, changed)
+	item := requireResponsesClientToolValue[map[string]any](t, requireResponsesClientToolValue[[]any](t, req["input"])[0])
+	require.Equal(t, "function_call_output", item["type"])
+	require.Equal(t, content, item["output"])
+}
+
+func TestAdaptResponsesClientTools_StringifiesNonContentToolOutput(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		output any
+		want   string
+	}{
+		{name: "object", output: map[string]any{"ok": true}, want: `{"ok":true}`},
+		{name: "arbitrary array", output: []any{"ok"}, want: `["ok"]`},
+		{name: "empty array", output: []any{}, want: `[]`},
+		{name: "unknown content", output: []any{map[string]any{"type": "output_text", "text": "bad"}}, want: `[{"text":"bad","type":"output_text"}]`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := map[string]any{
+				"tools": []any{map[string]any{"type": "custom", "name": "exec"}},
+				"input": []any{map[string]any{"type": "custom_tool_call_output", "call_id": "call_1", "output": tc.output}},
+			}
+			_, _, err := AdaptResponsesClientTools(req)
+			require.NoError(t, err)
+			item := requireResponsesClientToolValue[map[string]any](t, requireResponsesClientToolValue[[]any](t, req["input"])[0])
+			require.Equal(t, tc.want, item["output"])
+		})
+	}
+}
+
 func TestAdaptResponsesClientTools_RejectsAmbiguousNames(t *testing.T) {
 	cases := []map[string]any{
 		{"tools": []any{map[string]any{"type": "custom", "name": "same"}, map[string]any{"type": "function", "name": "same"}}},

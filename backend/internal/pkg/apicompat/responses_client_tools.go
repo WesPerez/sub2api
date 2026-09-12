@@ -193,6 +193,9 @@ func normalizeClientToolOutput(item map[string]any) {
 	if _, ok := output.(string); ok {
 		return
 	}
+	if isResponsesToolOutputContent(output) {
+		return
+	}
 	if output == nil {
 		item["output"] = ""
 		return
@@ -203,6 +206,28 @@ func normalizeClientToolOutput(item map[string]any) {
 		return
 	}
 	item["output"] = string(encoded)
+}
+
+// isResponsesToolOutputContent reports whether output already uses the
+// Responses API content-list form accepted for image and file tool results.
+// Other JSON values still need string encoding for function_call_output.
+func isResponsesToolOutputContent(output any) bool {
+	parts, ok := output.([]any)
+	if !ok || len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		typed, ok := part.(map[string]any)
+		if !ok {
+			return false
+		}
+		switch stringValue(typed["type"]) {
+		case "input_text", "input_image", "input_file":
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func rewriteClientToolChoice(req map[string]any, adapter *ResponsesClientToolMapping) bool {
