@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "title": "Sub2API 代理配置对齐",
+  "description": "把受管账号关联到对应的 Resin 代理配置",
+  "category": "accounts",
+  "manual": true,
+  "effect": "按已有代理策略修改匹配账号的代理关联。",
+  "operating_note": "保持显式 Global、CN、直连选择，只对缺失或旧绑定进行对齐。平台与出口身份由任务部署维护。"
+}

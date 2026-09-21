@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "title": "AgentRouter 账号恢复",
+  "description": "按类型恢复账号，开放余额最高的指定数量账号",
+  "category": "accounts",
+  "manual": true,
+  "effect": "恢复可用状态，重新选择并开放各类型余额最高的账号；不充值或重写消费记录。"
+}

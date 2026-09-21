@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "site_host": "agentrouter.org",
+  "groups": [
+    {"id": "gpt", "label": "GPT", "aliases": ["gpt"], "top_n": 3},
+    {"id": "claude", "label": "Claude", "aliases": ["claude"], "top_n": 3},
+    {"id": "glm", "label": "GLM", "aliases": ["glm"], "top_n": 3},
+    {"id": "deepseek", "label": "DeepSeek", "aliases": ["deepseek"], "top_n": 3}
+  ]
+}

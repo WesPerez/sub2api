@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover and select AgentRouter accounts hourly
+
+[Timer]
+OnCalendar=*-*-* *:00:00 Asia/Shanghai
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=false
+Unit=sub2api-recovery.service
+
+[Install]
+WantedBy=timers.target

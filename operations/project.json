@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "id": "sub2api",
+  "task_directory": "operations/tasks",
+  "title": "Sub2API",
+  "description": "账号恢复、计划测试与账号维护",
+  "link": "https://wooai.cc.cd/admin/accounts",
+  "applications": [
+    {
+      "id": "app:sub2api:scheduled-tests",
+      "title": "账号计划测试",
+      "description": "逐账号设置测试模型和执行计划，在账号页面查看连通性与测试结果。",
+      "schedule_text": "按各账号的测试计划",
+      "link": "https://wooai.cc.cd/admin/accounts"
+    },
+    {
+      "id": "app:sub2api:tokens",
+      "title": "OAuth 令牌刷新",
+      "description": "应用自动刷新授权；账号页显示授权状态和错误，避免额外恢复任务重复操作。",
+      "schedule_text": "由应用按令牌到期时间维护",
+      "link": "https://wooai.cc.cd/admin/accounts"
+    },
+    {
+      "id": "app:sub2api:cleanup",
+      "title": "用量与过期数据维护",
+      "description": "保留策略由应用设置维护；相关清理随应用启动并受内部开关控制。",
+      "schedule_text": "应用内周期维护",
+      "link": "https://wooai.cc.cd/admin/settings"
+    },
+    {
+      "id": "app:sub2api:channels",
+      "title": "渠道健康监测",
+      "description": "按渠道策略检查可用性并汇总监测结果。",
+      "schedule_text": "按渠道监测配置",
+      "link": "https://wooai.cc.cd/admin/channels/monitor"
+    }
+  ]
+}

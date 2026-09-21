@@ -1,0 +1,66 @@
+{
+  "schema_version": 2,
+  "state_dir": "/var/lib/server-scheduled-tasks/sub2api-proxy-reconcile",
+  "lock_file": "/run/lock/sub2api-proxy-reconcile.lock",
+  "legacy_proxy_name_regexes": [],
+  "sub2api": {
+    "base_url": "http://127.0.0.1:13080/api/v1",
+    "docker_binary": "/usr/bin/docker",
+    "postgres_container": "sub2api-prod-postgres",
+    "db_user": "sub2api",
+    "db_name": "sub2api"
+  },
+  "profiles": [
+    {
+      "key": "global",
+      "name": "Global",
+      "resin_platform": "AppsGlobal",
+      "protocol": "socks5h",
+      "host": "proxy.internal",
+      "port": 10834,
+      "username_template": "AppsGlobal.sub2-{{account_id}}",
+      "token_ref": "apps",
+      "inherit_legacy_lease": false,
+      "allowed_account_platforms": [
+        "grok",
+        "openai"
+      ],
+      "default_for": [
+        "grok",
+        "openai"
+      ]
+    },
+    {
+      "key": "cn",
+      "name": "CN",
+      "resin_platform": "AppsCN",
+      "protocol": "socks5h",
+      "host": "proxy.internal",
+      "port": 10834,
+      "username_template": "AppsCN.sub2-{{account_id}}",
+      "token_ref": "apps",
+      "inherit_legacy_lease": false,
+      "allowed_account_platforms": [
+        "grok",
+        "openai"
+      ],
+      "default_for": []
+    },
+    {
+      "key": "direct",
+      "name": "直连",
+      "data_plane": "direct",
+      "protocol": "socks5h",
+      "host": "proxy.internal",
+      "port": 12400,
+      "username_template": "sub2-direct",
+      "token_ref": "direct",
+      "inherit_legacy_lease": false,
+      "allowed_account_platforms": [
+        "grok",
+        "openai"
+      ],
+      "default_for": []
+    }
+  ]
+}

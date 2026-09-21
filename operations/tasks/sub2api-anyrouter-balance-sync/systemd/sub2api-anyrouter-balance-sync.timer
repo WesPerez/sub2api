@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AnyRouter to Sub2API balance sync periodically
+
+[Timer]
+OnCalendar=*-*-* *:33:00
+AccuracySec=1s
+Persistent=true
+Unit=sub2api-anyrouter-balance-sync.service
+
+[Install]
+WantedBy=timers.target

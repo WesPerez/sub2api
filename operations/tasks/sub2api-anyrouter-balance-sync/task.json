@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "title": "AnyRouter 余额同步备用任务",
+  "description": "备用余额查询与备注同步，当前由原任务策略决定启停",
+  "category": "accounts",
+  "manual": true,
+  "effect": "查询站点余额并更新 Sub2API 账号备注，不发送模型请求。",
+  "operating_note": "此任务为备用同步。MetAPI 主同步正常时保持暂停；遇到同类任务占用锁会跳过本次，不重复回写。",
+  "skip_exit_codes": [
+    75
+  ]
+}

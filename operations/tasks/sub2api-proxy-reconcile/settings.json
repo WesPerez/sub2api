@@ -1,0 +1,40 @@
+{
+  "sub2api-proxy-reconcile.timer": {
+    "file": "sub2api-proxy-reconcile.json",
+    "format": "json",
+    "title": "账号代理对齐方式",
+    "description": "检查既有 Global、CN 和直连策略是否与账号绑定一致。",
+    "fields": [
+      {
+        "key": "operating.audit_only",
+        "label": "只检查，不修改绑定",
+        "type": "boolean",
+        "default": false,
+        "help": "开启后仅生成检查结果，即使定时器开启也不写入代理绑定。"
+      },
+      {
+        "key": "operating.sub2_timeout_seconds",
+        "label": "Sub2API 请求超时",
+        "type": "integer",
+        "default": 20,
+        "min": 5,
+        "max": 20,
+        "unit": "秒",
+        "section": "常用参数",
+        "help": ""
+      },
+      {
+        "key": "operating.resin_timeout_seconds",
+        "label": "Resin 请求超时",
+        "type": "integer",
+        "default": 10,
+        "min": 5,
+        "max": 10,
+        "unit": "秒",
+        "section": "常用参数",
+        "help": ""
+      }
+    ],
+    "effect": "下一次对齐时生效；账号平台与代理身份映射继续由原配置维护。"
+  }
+}
