@@ -1,0 +1,18 @@
+[Unit]
+Description=Sync live AnyRouter balances into Sub2API account notes
+Wants=network-online.target
+After=network-online.target resin-apps.service docker.service
+Requires=docker.service resin-apps.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/server-scheduled-tasks/anyrouter-balance-operations.env
+SuccessExitStatus=75
+WorkingDirectory=/opt/sub2api-operations/operations/tasks/sub2api-anyrouter-balance-sync
+ExecStart=/opt/sub2api-operations/operations/tasks/sub2api-anyrouter-balance-sync/sync-anyrouter-balances-to-sub2api-notes.sh
+TimeoutStartSec=5min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+StandardOutput=journal
+StandardError=journal

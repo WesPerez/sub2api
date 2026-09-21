@@ -1,0 +1,24 @@
+{
+  "sub2api-anyrouter-balance-sync.timer": {
+    "file": "anyrouter-balance-operations.env",
+    "format": "env",
+    "title": "备用余额同步方式",
+    "description": "仅用于主同步故障时的备用处理，固定核对原 6 个账号。",
+    "fields": [
+      {
+        "key": "APPLY",
+        "label": "回写账号备注余额",
+        "type": "boolean",
+        "default": true,
+        "encoding": "flag",
+        "help": "关闭后读取并核对余额，但数据库事务回滚，不保存备注。"
+      }
+    ],
+    "optional_file": true,
+    "effect": "下一次备用同步时生效；保存不会开启已暂停的定时器。",
+    "notes": [
+      "与 MetAPI 主同步共用锁，主同步正常时应保持本任务暂停。",
+      "账号名单、Cookie、主账号键及出口身份由原部署维护。"
+    ]
+  }
+}

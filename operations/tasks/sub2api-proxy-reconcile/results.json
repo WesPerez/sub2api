@@ -1,0 +1,58 @@
+{
+  "sub2api-proxy-reconcile.timer": {
+    "source": "journal",
+    "at": "_reported_at",
+    "summary": "账号代理关联核对结果",
+    "metrics": [
+      {
+        "path": "status",
+        "label": "处理结果",
+        "labels": {
+          "ok": "完成",
+          "planned": "仅检查，未改动",
+          "skipped": "本次跳过",
+          "error": "失败",
+          "strict": "已按验证资格收口",
+          "success": "完成"
+        }
+      },
+      {
+        "path": "accounts",
+        "label": "核对账号",
+        "unit": "个"
+      },
+      {
+        "path": "plan.accounts",
+        "label": "核对账号",
+        "unit": "个"
+      },
+      {
+        "path": "rebound_accounts",
+        "label": "本轮更新关联",
+        "unit": "个"
+      },
+      {
+        "path": "plan.binding_changes",
+        "label": "待更新关联",
+        "op": "count",
+        "unit": "个"
+      },
+      {
+        "path": "created_profiles",
+        "label": "新增代理配置",
+        "unit": "个"
+      },
+      {
+        "path": "inherited_leases",
+        "label": "继承出口租约",
+        "unit": "个"
+      }
+    ],
+    "match_any": [
+      "status"
+    ],
+    "status_map": {
+      "skipped": "skipped"
+    }
+  }
+}

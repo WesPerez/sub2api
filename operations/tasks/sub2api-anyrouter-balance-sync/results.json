@@ -1,0 +1,15 @@
+{
+  "sub2api-anyrouter-balance-sync.timer": {
+    "source": "journal",
+    "at": "_reported_at",
+    "match_any": ["status"],
+    "summary": "备用余额查询与备注同步结果",
+    "status_map": {"skipped": "skipped"},
+    "metrics": [
+      {"path": "status", "label": "处理结果", "labels": {"applied": "已同步备注", "preview": "仅预览，未写入", "skipped": "本次跳过"}},
+      {"path": "accounts", "label": "核对账号", "unit": "个"},
+      {"path": "total_balance", "label": "查询余额合计", "unit": "USD"},
+      {"path": "reason", "label": "跳过原因", "labels": {"balance sync lock busy": "其他余额同步正在运行"}}
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Restore Sub2API production network and dependencies
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/opt/sub2api-operations/operations/tasks/sub2api-network-attachment/restore-network.sh
+TimeoutStartSec=240
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+[Unit]
+Description=Reconcile Sub2API accounts with shared Resin proxy profiles
+After=network-online.target docker.service resin-apps.service
+Wants=network-online.target docker.service resin-apps.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+LoadCredential=sub2_admin_key:/etc/server-scheduled-tasks/sub2api-admin-key
+LoadCredential=apps_proxy_token:/etc/resin-apps/proxy.token
+LoadCredential=direct_proxy_token:/etc/server-scheduled-tasks/sub2-direct-proxy.token
+ExecStart=/usr/bin/python3 /opt/sub2api-operations/operations/tasks/sub2api-proxy-reconcile/sub2api_proxy_reconcile.py --config /etc/server-scheduled-tasks/sub2api-proxy-reconcile.json --sub2-admin-key-file %d/sub2_admin_key --profile-token-file apps=%d/apps_proxy_token --profile-token-file direct=%d/direct_proxy_token --apply
+RuntimeDirectory=sub2api-proxy-reconcile
+RuntimeDirectoryMode=0700
+TimeoutStartSec=15min
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/opt/sub2api-operations /etc/server-scheduled-tasks/sub2api-proxy-reconcile.json
+ReadWritePaths=/var/lib/server-scheduled-tasks/sub2api-proxy-reconcile /run/lock
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native

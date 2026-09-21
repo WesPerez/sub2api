@@ -1,0 +1,31 @@
+name: Project operations
+
+on:
+  push:
+    branches: [mine, debug, 'feat/project-operations-*']
+    paths: ['operations/**', '.github/workflows/operations.yml']
+  pull_request:
+    paths: ['operations/**', '.github/workflows/operations.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install pytest
+      - name: Verify recovery and proxy policies without production APIs
+        run: python -B -m pytest -q --import-mode=importlib operations
+      - name: Verify backup note rendering
+        run: |
+          bash -n operations/tasks/sub2api-anyrouter-balance-sync/sync-anyrouter-balances-to-sub2api-notes.sh
+          bash operations/tasks/sub2api-anyrouter-balance-sync/note-render.test.sh

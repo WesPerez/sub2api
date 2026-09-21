@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep Sub2API production network attachment available
+
+[Timer]
+OnActiveSec=5s
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=sub2api-prod-network.service
+
+[Install]
+WantedBy=timers.target
