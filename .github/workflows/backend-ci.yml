@@ -47,6 +47,11 @@ jobs:
       - name: Unit tests
         working-directory: backend
         run: make test-unit
+      - name: Resin response recovery race tests
+        working-directory: backend
+        run: |
+          go test -race ./internal/pkg/resinrecovery
+          go test -race -run '^TestResinRecovery' ./internal/repository ./internal/service
 
   test-integration:
     runs-on: ubuntu-latest
