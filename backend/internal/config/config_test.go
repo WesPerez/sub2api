@@ -627,6 +627,49 @@ func TestLoadOpenAIProxyStreamCircuitFromEnv(t *testing.T) {
 	require.Equal(t, 420, cfg.Gateway.OpenAIProxyStreamCircuit.TTLSeconds)
 }
 
+func TestLoadResinRecoveryDefaultsAndEnv(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.False(t, cfg.Gateway.ResinRecovery.Enabled)
+	require.Empty(t, cfg.Gateway.ResinRecovery.ProxyEndpoints)
+	require.Equal(t, 3, cfg.Gateway.ResinRecovery.FailureThreshold)
+	require.Equal(t, 60, cfg.Gateway.ResinRecovery.WindowSeconds)
+	t.Setenv("GATEWAY_RESIN_RECOVERY_ENABLED", "true")
+	t.Setenv("GATEWAY_RESIN_RECOVERY_PROXY_ENDPOINTS", "proxy.internal:10834,172.17.0.1:10834")
+	t.Setenv("GATEWAY_RESIN_RECOVERY_FAILURE_THRESHOLD", "4")
+	t.Setenv("GATEWAY_RESIN_RECOVERY_WINDOW_SECONDS", "90")
+	cfg, err = Load()
+	require.NoError(t, err)
+	require.True(t, cfg.Gateway.ResinRecovery.Enabled)
+	require.Equal(t, []string{"proxy.internal:10834", "172.17.0.1:10834"}, cfg.Gateway.ResinRecovery.ProxyEndpoints)
+	require.Equal(t, 4, cfg.Gateway.ResinRecovery.FailureThreshold)
+	require.Equal(t, 90, cfg.Gateway.ResinRecovery.WindowSeconds)
+}
+
+func TestValidateResinRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value GatewayResinRecoveryConfig
+	}{
+		{"no-endpoints", GatewayResinRecoveryConfig{Enabled: true}},
+		{"url-instead-of-endpoint", GatewayResinRecoveryConfig{ProxyEndpoints: []string{"http://proxy.internal:10834"}}},
+		{"credentials", GatewayResinRecoveryConfig{ProxyEndpoints: []string{"secret@proxy.internal:10834"}}},
+		{"port-name", GatewayResinRecoveryConfig{ProxyEndpoints: []string{"proxy.internal:socks"}}},
+		{"port-range", GatewayResinRecoveryConfig{ProxyEndpoints: []string{"proxy.internal:65536"}}},
+		{"threshold-range", GatewayResinRecoveryConfig{FailureThreshold: 21}},
+		{"window-range", GatewayResinRecoveryConfig{WindowSeconds: 3601}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetViperWithJWTSecret(t)
+			cfg, err := Load()
+			require.NoError(t, err)
+			cfg.Gateway.ResinRecovery = tc.value
+			require.ErrorContains(t, cfg.Validate(), "gateway.resin_recovery.")
+		})
+	}
+}
+
 func TestLoadOpenAIHTTP2DisabledFromEnv(t *testing.T) {
 	resetViperWithJWTSecret(t)
 	t.Setenv("GATEWAY_OPENAI_HTTP2_ENABLED", "false")

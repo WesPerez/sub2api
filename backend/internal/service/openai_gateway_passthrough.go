@@ -18,6 +18,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
 	"github.com/Wei-Shaw/sub2api/internal/util/responseheaders"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -1867,6 +1868,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	sawResponseFailed := false
 	terminalEventType := ""
 	semanticOutputSeen := false
+	recoveryOutcome := resinrecovery.Outcome("")
+	defer func() {
+		if !clientDisconnected && ctx.Err() == nil {
+			resinrecovery.Report(ctx, resp.Body, recoveryOutcome)
+		}
+	}()
 	capacityFailoverSuppressedLogged := false
 	failedMessage := ""
 	clientOutputStarted := false
@@ -2037,6 +2044,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			}
 			cyberHit := false
 			if eventType == "response.failed" || eventType == "error" {
+				recoveryOutcome = resinrecovery.Reachable
 				if codexFailureTerminal && eventType == "error" {
 					sawBareError = true
 					bareErrorPayload = append(bareErrorPayload[:0], dataBytes...)
@@ -2123,6 +2131,7 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				terminalEventType = "[DONE]"
 			}
 			if openAIStreamEventIsTerminalWithType(trimmedData, eventType) {
+				recoveryOutcome = resinrecovery.Reachable
 				sawTerminalEvent = true
 				if trimmedData != "[DONE]" {
 					terminalEventType = eventType
@@ -2216,6 +2225,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			logger.LegacyPrintf("service.openai_gateway", "[OpenAI passthrough] SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, err)
 			return resultWithUsage(), err
 		}
+		if recoveryOutcome == "" {
+			recoveryOutcome = resinrecovery.InvalidStream
+		}
 		if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
 			msg := "OpenAI stream disconnected before completion"
 			if errText := strings.TrimSpace(err.Error()); errText != "" {
@@ -2227,7 +2239,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		if clientDisconnected {
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete after disconnect: %w", err)
 		}
-		s.recordOpenAIProxyStreamDisconnect(account, err, upstreamRequestID)
+		if !resinrecovery.IsManaged(resp.Body) {
+			s.recordOpenAIProxyStreamDisconnect(account, err, upstreamRequestID)
+		}
 		logger.LegacyPrintf("service.openai_gateway",
 			"[OpenAI passthrough] 流读取异常中断: account=%d request_id=%s err=%v",
 			account.ID,
@@ -2240,6 +2254,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		return resultWithUsage(), fmt.Errorf("upstream response failed: %s", failedMessage)
 	}
 	if !clientDisconnected && !sawDone && !sawTerminalEvent && ctx.Err() == nil {
+		if recoveryOutcome == "" {
+			recoveryOutcome = resinrecovery.EmptyStream
+		}
 		logger.FromContext(ctx).With(
 			zap.String("component", "service.openai_gateway"),
 			zap.Int64("account_id", account.ID),
@@ -2249,7 +2266,9 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			return resultWithUsage(),
 				s.newOpenAIStreamFailoverError(c, account, true, upstreamRequestID, nil, "OpenAI stream ended before a terminal event")
 		}
-		s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+		if !resinrecovery.IsManaged(resp.Body) {
+			s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
+		}
 		return resultWithUsage(), errors.New("stream usage incomplete: missing terminal event")
 	}
 	if (sawDone || sawTerminalEvent) && !sawFailedEvent {
@@ -2272,6 +2291,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if err != nil {
 		return nil, err
 	}
+	reportOpenAIResinBuffered(ctx, resp, body)
 	observer := upstreamResponseModelObserverFromContext(c)
 	if observer == nil {
 		observer = beginUpstreamResponseModelObservation(c)

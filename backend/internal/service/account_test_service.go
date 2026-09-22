@@ -31,6 +31,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/geminicli"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
 	"github.com/Wei-Shaw/sub2api/internal/util/urlvalidator"
 	"github.com/gin-gonic/gin"
@@ -2946,16 +2947,28 @@ func (s *AccountTestService) processOpenAIChatCompletionsStream(c *gin.Context, 
 func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader) error {
 	reader := bufio.NewReader(body)
 	seenCompleted := false
+	recoveryOutcome := resinrecovery.Outcome("")
+	defer func() {
+		if c.Request.Context().Err() == nil {
+			resinrecovery.Report(c.Request.Context(), body, recoveryOutcome)
+		}
+	}()
 
 	for {
 		line, err := reader.ReadString('\n')
-		if err != nil {
+		if err != nil && (err != io.EOF || len(line) == 0) {
 			if err == io.EOF {
 				if seenCompleted {
 					s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 					return nil
 				}
+				if recoveryOutcome == "" {
+					recoveryOutcome = resinrecovery.EmptyStream
+				}
 				return s.sendErrorAndEnd(c, "Stream ended before response.completed")
+			}
+			if recoveryOutcome == "" && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				recoveryOutcome = resinrecovery.InvalidStream
 			}
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Stream read error: %s", err.Error()))
 		}
@@ -2968,9 +2981,11 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 		jsonStr := sseDataPrefix.ReplaceAllString(line, "")
 		if jsonStr == "[DONE]" {
 			if seenCompleted {
+				recoveryOutcome = resinrecovery.Reachable
 				s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 				return nil
 			}
+			recoveryOutcome = resinrecovery.EmptyStream
 			return s.sendErrorAndEnd(c, "Stream ended before response.completed")
 		}
 
@@ -2988,9 +3003,11 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 				s.sendEvent(c, TestEvent{Type: "content", Text: delta})
 			}
 		case "response.completed", "response.done":
+			recoveryOutcome = resinrecovery.Reachable
 			s.sendEvent(c, TestEvent{Type: "test_complete", Success: true})
 			return nil
 		case "response.failed":
+			recoveryOutcome = resinrecovery.Reachable
 			errorMsg := "OpenAI response failed"
 			if responseData, ok := data["response"].(map[string]any); ok {
 				if errData, ok := responseData["error"].(map[string]any); ok {
@@ -3001,6 +3018,7 @@ func (s *AccountTestService) processOpenAIStream(c *gin.Context, body io.Reader)
 			}
 			return s.sendErrorAndEnd(c, errorMsg)
 		case "error":
+			recoveryOutcome = resinrecovery.Reachable
 			errorMsg := "Unknown error"
 			if errData, ok := data["error"].(map[string]any); ok {
 				if msg, ok := errData["message"].(string); ok {
