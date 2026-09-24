@@ -773,6 +773,7 @@ func decodeCachedAccount(val any) (*service.Account, error) {
 	if err := json.Unmarshal(payload, &account); err != nil {
 		return nil, err
 	}
+	account.BindProxyIdentity()
 	return &account, nil
 }
 
