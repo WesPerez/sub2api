@@ -13,6 +13,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai_compat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -1087,7 +1088,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, err, false)
 		}
 		if headerGuard != nil {
-			resp.Body = &openAIRequestContextReadCloser{ReadCloser: resp.Body, cleanup: headerGuard.close}
+			resp.Body = resinrecovery.PreserveBodyObservation(
+				&openAIRequestContextReadCloser{ReadCloser: resp.Body, cleanup: headerGuard.close}, resp.Body,
+			)
 		}
 
 		// Handle error response
