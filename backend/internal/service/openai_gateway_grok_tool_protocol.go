@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -126,7 +127,7 @@ func newResponsesClientToolStreamBody(
 	reader, writer := io.Pipe()
 	body := &responsesClientToolStreamBody{PipeReader: reader, source: source}
 	go transformResponsesClientToolStream(source, writer, mapping, maxLineSize)
-	return body
+	return resinrecovery.PreserveBodyObservation(body, source)
 }
 
 func newGrokResponsesClientToolStreamBody(

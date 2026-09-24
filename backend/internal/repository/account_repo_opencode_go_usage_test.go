@@ -435,14 +435,18 @@ func TestBulkUpdateOpenCodeGoProxyChangeClearsSnapshotOnly(t *testing.T) {
 
 func TestInvalidateProxyProbeSnapshotsClearsOpenCodeGoSnapshot(t *testing.T) {
 	client, mock := newOllamaCloudUsageRepositoryTestClient(t)
-	mock.ExpectQuery(`(?s)UPDATE accounts.*opencode_go_usage_snapshot.*RETURNING id`).
+	mock.ExpectExec(`(?s)UPDATE accounts.*opencode_go_usage_snapshot.*deleted_at IS NULL`).
 		WithArgs(int64(9)).
-		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)))
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	// Proxy identity changes must also refresh hydrated accounts without a probe snapshot.
+	mock.ExpectQuery(`(?s)SELECT id.*FROM accounts.*proxy_id = \$1.*ORDER BY id`).
+		WithArgs(int64(9)).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(int64(17)).AddRow(int64(18)))
 
 	ids, err := invalidateProxyProbeSnapshots(context.Background(), client, 9)
 
 	require.NoError(t, err)
-	require.Equal(t, []int64{17}, ids)
+	require.Equal(t, []int64{17, 18}, ids)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
