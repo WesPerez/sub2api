@@ -649,6 +649,13 @@ func ProvideScheduledTestService(
 }
 
 // ProvideScheduledTestRunnerService creates and starts ScheduledTestRunnerService.
+func ProvideAgentRouterRecoveryService(repo RecoveryRepository, accounts AccountRepository, states *RateLimitService) *AgentRouterRecoveryService {
+	svc := NewAgentRouterRecoveryService(repo, accounts, states)
+	svc.Start()
+	return svc
+}
+
+// ProvideScheduledTestRunnerService creates and starts ScheduledTestRunnerService.
 func ProvideScheduledTestRunnerService(
 	planRepo ScheduledTestPlanRepository,
 	scheduledSvc *ScheduledTestService,
@@ -960,6 +967,8 @@ var ProviderSet = wire.NewSet(
 	ProvideIdempotencyCleanupService,
 	ProvideScheduledTestService,
 	ProvideScheduledTestRunnerService,
+	ProvideAgentRouterRecoveryService,
+	NewAccountNotesService,
 	NewGroupCapacityService,
 	NewChannelService,
 	wire.Bind(new(ChannelCacheInvalidator), new(*ChannelService)),

@@ -45,6 +45,7 @@ func RegisterAdminRoutes(
 
 		// 账号管理
 		registerAccountRoutes(admin, h, stepUpAuth)
+		registerAccountMaintenanceRoutes(admin, h)
 
 		// 公告管理
 		registerAnnouncementRoutes(admin, h)
@@ -719,6 +720,23 @@ func registerUserAttributeRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		attrs.PUT("/reorder", h.Admin.UserAttribute.ReorderDefinitions)
 		attrs.PUT("/:id", h.Admin.UserAttribute.UpdateDefinition)
 		attrs.DELETE("/:id", h.Admin.UserAttribute.DeleteDefinition)
+	}
+}
+
+func registerAccountMaintenanceRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	if h.Admin.AccountNotes != nil {
+		notes := admin.Group("/account-notes")
+		notes.GET("", h.Admin.AccountNotes.List)
+		notes.GET("/:id", h.Admin.AccountNotes.Get)
+		notes.PUT("/:id", h.Admin.AccountNotes.Update)
+	}
+	if h.Admin.AgentRouterRecovery != nil {
+		recovery := admin.Group("/agentrouter-recovery")
+		recovery.GET("", h.Admin.AgentRouterRecovery.Config)
+		recovery.PUT("", h.Admin.AgentRouterRecovery.Save)
+		recovery.POST("/preview", h.Admin.AgentRouterRecovery.Preview)
+		recovery.POST("/run", h.Admin.AgentRouterRecovery.Run)
+		recovery.GET("/runs", h.Admin.AgentRouterRecovery.History)
 	}
 }
 
