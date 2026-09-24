@@ -4,12 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMigrationApplicationNameIsSafeKeywordDSNValue(t *testing.T) {
+	for _, hostname := range []string{
+		"sub2api-debug-1",
+		"name with spaces",
+		"name'with\\quotes",
+		strings.Repeat("a", 100),
+	} {
+		got := migrationApplicationName(hostname)
+		if len(got) > 63 {
+			t.Fatalf("application_name length = %d, want <= 63", len(got))
+		}
+		for _, r := range got {
+			allowed := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-'
+			if !allowed {
+				t.Fatalf("application_name %q contains an unsafe DSN character", got)
+			}
+		}
+	}
+}
 
 func transientDatabaseError(code string) error {
 	return &pq.Error{Code: pq.ErrorCode(code), Message: "database is temporarily unavailable"}

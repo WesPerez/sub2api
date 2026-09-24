@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/ent"
@@ -110,7 +112,12 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 
 	// 构建包含时区信息的数据库连接字符串 (DSN)。
 	// 时区信息会传递给 PostgreSQL，确保数据库层面的时间处理正确。
-	dsn := cfg.Database.DSNWithTimezone(cfg.Timezone)
+	hostname := strings.TrimSpace(os.Getenv("HOSTNAME"))
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	applicationName := migrationApplicationName(hostname)
+	dsn := cfg.Database.DSNWithTimezone(cfg.Timezone) + " application_name='" + applicationName + "'"
 
 	// 使用 Ent 的 SQL 驱动打开 PostgreSQL 连接。
 	// dialect.Postgres 指定使用 PostgreSQL 方言进行 SQL 生成。
@@ -135,12 +142,22 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 	// 这种方式比 Ent 的自动迁移更可控，支持复杂的迁移场景。
 	migrationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
+	migrationReporter, stopMigrationReporter := startMigrationProgressReporter(migrationCtx, applicationName)
+	migrationReporter("started", "", 0, time.Time{})
 	if err := initializeDatabaseWithRetry(migrationCtx, func(ctx context.Context) error {
-		return applyMigrationsFS(ctx, drv.DB(), migrations.FS)
+		return applyMigrationsFSWithProgress(ctx, drv.DB(), migrations.FS, migrationReporter)
 	}); err != nil {
+		stopMigrationReporter()
+		migrationReporter("failed", "", 0, time.Time{})
+		slog.Error("database migration startup failed",
+			"migration_application_name", applicationName,
+			"error", err,
+		)
 		_ = drv.Close() // 迁移失败时关闭驱动，避免资源泄露
 		return nil, nil, err
 	}
+	stopMigrationReporter()
+	migrationReporter("completed", "", 0, time.Time{})
 
 	// 创建 Ent 客户端，绑定到已配置的数据库驱动。
 	client := ent.NewClient(ent.Driver(drv))
@@ -165,6 +182,94 @@ func InitEnt(cfg *config.Config) (*ent.Client, *sql.DB, error) {
 	}
 
 	return client, drv.DB(), nil
+}
+
+func migrationApplicationName(hostname string) string {
+	const prefix = "sub2api-"
+	const maxPostgresIdentifierBytes = 63
+
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" {
+		hostname = "unknown"
+	}
+
+	var safe strings.Builder
+	for _, r := range hostname {
+		if safe.Len() >= maxPostgresIdentifierBytes-len(prefix) {
+			break
+		}
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '.' || r == '-' {
+			_, _ = safe.WriteRune(r)
+		} else {
+			_ = safe.WriteByte('-')
+		}
+	}
+	if safe.Len() == 0 {
+		_, _ = safe.WriteString("unknown")
+	}
+	return prefix + safe.String()
+}
+
+func startMigrationProgressReporter(ctx context.Context, applicationName string) (migrationProgressFunc, func()) {
+	started := time.Now().UTC()
+	deadline, _ := ctx.Deadline()
+	var mu sync.Mutex
+	attempt, backendPID := 0, 0
+	var backendStart time.Time
+	currentMigration, phase := "", "started"
+	emit := func(event string) {
+		attrs := []any{
+			"migration_event", event,
+			"migration_application_name", applicationName,
+			"migration_started_at", started.Format(time.RFC3339Nano),
+			"migration_deadline_at", deadline.UTC().Format(time.RFC3339Nano),
+			"migration_observed_at", time.Now().UTC().Format(time.RFC3339Nano),
+			"migration_attempt", attempt,
+			"migration_backend_pid", backendPID,
+			"migration_backend_start", backendStart.UTC().Format(time.RFC3339Nano),
+			"migration_phase", phase,
+			"migration", currentMigration,
+		}
+		if event == "failed" {
+			slog.Error("database migration startup failed", attrs...)
+		} else {
+			slog.Info("database migration progress", attrs...)
+		}
+	}
+	reporterCtx, cancelReporter := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-reporterCtx.Done():
+				return
+			case <-ticker.C:
+				mu.Lock()
+				emit("heartbeat")
+				mu.Unlock()
+			}
+		}
+	}()
+	report := func(event, migration string, pid int, backendStarted time.Time) {
+		mu.Lock()
+		defer mu.Unlock()
+		if event == "waiting_for_connection" {
+			attempt++
+			backendPID, backendStart = 0, time.Time{}
+		}
+		if pid > 0 {
+			backendPID, backendStart = pid, backendStarted
+		}
+		phase, currentMigration = event, migration
+		emit(event)
+	}
+	return report, func() {
+		cancelReporter()
+		<-done
+	}
 }
 
 // ensureSimpleModeStartup keeps admin concurrency setup independent of group seeding.

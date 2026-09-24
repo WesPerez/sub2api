@@ -120,6 +120,12 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 	return applyMigrationsFS(ctx, db, migrations.FS)
 }
 
+type migrationProgressFunc func(event, migration string, backendPID int, backendStart time.Time)
+
+func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	return applyMigrationsFSWithProgress(ctx, db, fsys, nil)
+}
+
 // applyMigrationsFS 是迁移执行的核心实现。
 // 它从指定的文件系统读取 SQL 迁移文件并按顺序应用。
 //
@@ -138,21 +144,38 @@ func ApplyMigrations(ctx context.Context, db *sql.DB) error {
 //   - ctx: 上下文
 //   - db: 数据库连接
 //   - fsys: 包含迁移文件的文件系统（通常是 embed.FS）
-func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+func applyMigrationsFSWithProgress(ctx context.Context, db *sql.DB, fsys fs.FS, report migrationProgressFunc) error {
 	if db == nil {
 		return errors.New("nil sql db")
+	}
+	var backendPID int
+	var backendStart time.Time
+	notify := func(event, migration string) {
+		if report != nil {
+			report(event, migration, backendPID, backendStart)
+		}
 	}
 
 	// 获取分布式锁，确保多实例部署时只有一个实例执行迁移。
 	// 这是 PostgreSQL 特有的 Advisory Lock 机制。
+	notify("waiting_for_connection", "")
 	lockConn, err := db.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migrations lock connection: %w", err)
 	}
 	defer func() { _ = lockConn.Close() }()
+	if report != nil {
+		if err := lockConn.QueryRowContext(ctx,
+			"SELECT pg_backend_pid(), backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid()",
+		).Scan(&backendPID, &backendStart); err != nil {
+			return fmt.Errorf("identify migrations connection: %w", err)
+		}
+	}
+	notify("waiting_for_lock", "")
 	if err := pgAdvisoryLock(ctx, lockConn); err != nil {
 		return err
 	}
+	notify("locked", "")
 	defer func() {
 		// 无论迁移是否成功，都要释放锁。
 		// 独立超时确保原 ctx 取消后仍会尝试释放，但数据库链路异常不会
@@ -182,6 +205,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 	sort.Strings(files) // 确保按文件名顺序执行迁移
 
 	for _, name := range files {
+		notify("checking_migration", name)
 		// 读取迁移文件内容
 		contentBytes, err := fs.ReadFile(fsys, name)
 		if err != nil {
@@ -247,6 +271,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 				if stripSQLLineComment(trimmed) == "" {
 					continue
 				}
+				notify("applying_migration", name)
 				if _, err := lockConn.ExecContext(ctx, trimmed); err != nil {
 					return fmt.Errorf("apply migration %s (non-tx statement %d): %w", name, i+1, err)
 				}
@@ -254,6 +279,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 			if _, err := lockConn.ExecContext(ctx, "INSERT INTO schema_migrations (filename, checksum) VALUES ($1, $2)", name, checksum); err != nil {
 				return fmt.Errorf("record migration %s (non-tx): %w", name, err)
 			}
+			notify("migration_applied", name)
 			continue
 		}
 
@@ -264,6 +290,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 		}
 
 		// 执行迁移 SQL
+		notify("applying_migration", name)
 		if _, err := tx.ExecContext(ctx, content); err != nil {
 			_ = tx.Rollback()
 			return fmt.Errorf("apply migration %s: %w", name, err)
@@ -280,6 +307,7 @@ func applyMigrationsFS(ctx context.Context, db *sql.DB, fsys fs.FS) error {
 			_ = tx.Rollback()
 			return fmt.Errorf("commit migration %s: %w", name, err)
 		}
+		notify("migration_applied", name)
 	}
 
 	return nil

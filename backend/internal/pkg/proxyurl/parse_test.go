@@ -41,6 +41,7 @@ func TestParse_有效HTTP代理(t *testing.T) {
 	}
 	if parsed == nil {
 		t.Fatal("parsed 不应为 nil")
+		return
 	}
 	if parsed.Host != "proxy.example.com:8080" {
 		t.Errorf("Host 不匹配: got %q", parsed.Host)
@@ -51,6 +52,10 @@ func TestParse_有效HTTPS代理(t *testing.T) {
 	_, parsed, err := Parse("https://proxy.example.com:443")
 	if err != nil {
 		t.Fatalf("有效 HTTPS 代理应成功: %v", err)
+	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
 	}
 	if parsed.Scheme != "https" {
 		t.Errorf("Scheme 不匹配: got %q", parsed.Scheme)
@@ -65,6 +70,10 @@ func TestParse_有效SOCKS5代理_自动升级为SOCKS5H(t *testing.T) {
 	// socks5 自动升级为 socks5h，确保 DNS 由代理端解析
 	if trimmed != "socks5h://127.0.0.1:1080" {
 		t.Errorf("trimmed 应升级为 socks5h: got %q", trimmed)
+	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
 	}
 	if parsed.Scheme != "socks5h" {
 		t.Errorf("Scheme 应升级为 socks5h: got %q", parsed.Scheme)
@@ -109,6 +118,7 @@ func TestParse_含密码URL脱敏(t *testing.T) {
 	}
 	if trimmed == "" || parsed == nil {
 		t.Fatal("应返回非空结果")
+		return
 	}
 	if parsed.Scheme != "socks5h" {
 		t.Errorf("Scheme 应升级为 socks5h: got %q", parsed.Scheme)
@@ -152,6 +162,10 @@ func TestParse_Scheme大小写不敏感(t *testing.T) {
 	if err != nil {
 		t.Fatalf("大写 SOCKS5 应被接受: %v", err)
 	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
+	}
 	if parsed.Scheme != "socks5h" {
 		t.Errorf("大写 SOCKS5 Scheme 应升级为 socks5h: got %q", parsed.Scheme)
 	}
@@ -171,6 +185,10 @@ func TestParse_带认证的有效代理(t *testing.T) {
 	if err != nil {
 		t.Fatalf("带认证的代理 URL 应成功: %v", err)
 	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
+	}
 	if parsed.User == nil {
 		t.Error("应保留 UserInfo")
 	}
@@ -183,6 +201,10 @@ func TestParse_IPv6地址(t *testing.T) {
 	trimmed, parsed, err := Parse("http://[::1]:8080")
 	if err != nil {
 		t.Fatalf("IPv6 代理 URL 应成功: %v", err)
+	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
 	}
 	if parsed.Hostname() != "::1" {
 		t.Errorf("Hostname 不匹配: got %q", parsed.Hostname())
@@ -200,6 +222,10 @@ func TestParse_SOCKS5H保持不变(t *testing.T) {
 	// socks5h 不需要升级，应保持原样
 	if trimmed != "socks5h://proxy.local:1080" {
 		t.Errorf("trimmed 不应变化: got %q", trimmed)
+	}
+	if parsed == nil {
+		t.Fatal("parsed 不应为 nil")
+		return
 	}
 	if parsed.Scheme != "socks5h" {
 		t.Errorf("Scheme 应保持 socks5h: got %q", parsed.Scheme)

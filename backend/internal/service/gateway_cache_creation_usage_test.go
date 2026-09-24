@@ -652,6 +652,7 @@ func TestAnthropicCacheOnlyBufferedSSEUsage(t *testing.T) {
 					}
 					recorder := httptest.NewRecorder()
 					ctx, _ := gin.CreateTestContext(recorder)
+					ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
 					response := &http.Response{Body: io.NopCloser(strings.NewReader(stream))}
 					var aggregate int
 					var err error
