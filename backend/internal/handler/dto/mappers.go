@@ -237,6 +237,7 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	}
 	redactedCreds, credsStatus := RedactCredentials(a.Credentials)
 	extra := redactAccountManagedExtra(a.Extra)
+	balance, balanceState := service.AccountIntegrationBalance(a)
 	var ollamaCloudUsage *service.OllamaCloudUsageState
 	if state := service.OllamaCloudUsageStateFromAccount(a); state.Eligible {
 		ollamaCloudUsage = state
@@ -254,6 +255,8 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		Credentials:             redactedCreds,
 		CredentialsStatus:       credsStatus,
 		Extra:                   extra,
+		BalanceSnapshot:         balance,
+		BalanceState:            balanceState,
 		OllamaCloudUsage:        ollamaCloudUsage,
 		OpenCodeGoUsage:         openCodeGoUsage,
 		ProxyID:                 a.ProxyID,
@@ -423,6 +426,7 @@ func redactAccountManagedExtra(extra map[string]any) map[string]any {
 		case service.OllamaCloudUsageSessionExtraKey,
 			service.OllamaCloudUsageAutoRefreshExtraKey,
 			service.OllamaCloudUsageSnapshotExtraKey,
+			service.IntegrationBalanceKey,
 			service.OpenCodeGoUsageAutoRefreshExtraKey,
 			service.OpenCodeGoUsageSnapshotExtraKey:
 			continue
