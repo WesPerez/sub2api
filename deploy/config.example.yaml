@@ -445,6 +445,13 @@ gateway:
     failure_threshold: 2
     window_seconds: 60
     ttl_seconds: 600
+  # Opt-in L7 recovery for trusted local Resin SOCKS endpoints (Resin v1 recovery API required).
+  # Endpoint allowlist contains host:port only, never credentials. See docs/resin-recovery.md.
+  resin_recovery:
+    enabled: false
+    proxy_endpoints: []
+    failure_threshold: 3
+    window_seconds: 60
   # Grok free-tier local soft gate (scheduler filter only; admin QueryQuota/import probe bypasses it).
   # Enabled by default because free detection requires an explicit subscription_tier/plan_type of "free".
   # Stats/query failures fail open so DB issues do not block all Grok traffic.
