@@ -119,6 +119,8 @@ backend/.installed
 tests
 !deploy/tests/
 !deploy/tests/**
+!operations/**/tests/
+!operations/**/tests/**
 CLAUDE.md
 .claude
 scripts
@@ -127,7 +129,6 @@ scripts
 .code-review-state
 #openspec/
 code-reviews/
-AGENTS.md
 backend/cmd/server/server
 deploy/docker-compose.override.yml
 .gocache/
@@ -141,6 +142,7 @@ docs/*
 !docs/COMPOSITE_GROUPS.md
 !docs/PLUGIN_DEVELOPMENT.md
 !docs/channel-monitor-v2-safe-defaults.md
+!docs/resin-recovery.md
 !docs/codex-credits.md
 !docs/legal/
 !docs/legal/*.md
