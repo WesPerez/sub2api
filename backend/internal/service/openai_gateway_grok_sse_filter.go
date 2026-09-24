@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
 )
 
 // OpenAI Responses SSE event types are a closed enum for strict clients
@@ -55,7 +56,7 @@ func newGrokResponsesBillingPingFilterBody(source io.ReadCloser, account *Accoun
 	reader, writer := io.Pipe()
 	body := &grokResponsesBillingPingFilterBody{PipeReader: reader, source: source}
 	go filterGrokResponsesBillingPings(source, writer, body.closeSource, maxLineSize, cfg)
-	return body
+	return resinrecovery.PreserveBodyObservation(body, source)
 }
 
 func filterGrokResponsesBillingPings(
