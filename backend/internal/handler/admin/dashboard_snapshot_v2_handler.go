@@ -40,6 +40,7 @@ type dashboardSnapshotV2Filters struct {
 	UserID                int64
 	APIKeyID              int64
 	AccountID             int64
+	AccountSearch         string
 	GroupID               int64
 	Model                 string
 	RequestType           *int16
@@ -56,6 +57,7 @@ type dashboardSnapshotV2CacheKey struct {
 	UserID                int64  `json:"user_id"`
 	APIKeyID              int64  `json:"api_key_id"`
 	AccountID             int64  `json:"account_id"`
+	AccountSearch         string `json:"account_search"`
 	GroupID               int64  `json:"group_id"`
 	Model                 string `json:"model"`
 	RequestType           *int16 `json:"request_type"`
@@ -103,6 +105,7 @@ func (h *DashboardHandler) GetSnapshotV2(c *gin.Context) {
 		UserID:                filters.UserID,
 		APIKeyID:              filters.APIKeyID,
 		AccountID:             filters.AccountID,
+		AccountSearch:         filters.AccountSearch,
 		GroupID:               filters.GroupID,
 		Model:                 filters.Model,
 		RequestType:           filters.RequestType,
@@ -192,6 +195,7 @@ func (h *DashboardHandler) buildSnapshotV2Response(
 			filters.NativeCompactionV2,
 			filters.BillingType,
 			filters.UpstreamModelMismatch,
+			filters.AccountSearch,
 		)
 		if err != nil {
 			return nil, errors.New("failed to get usage trend")
@@ -214,6 +218,7 @@ func (h *DashboardHandler) buildSnapshotV2Response(
 			filters.NativeCompactionV2,
 			filters.BillingType,
 			filters.UpstreamModelMismatch,
+			filters.AccountSearch,
 		)
 		if err != nil {
 			return nil, errors.New("failed to get model statistics")
@@ -235,6 +240,7 @@ func (h *DashboardHandler) buildSnapshotV2Response(
 			filters.NativeCompactionV2,
 			filters.BillingType,
 			filters.UpstreamModelMismatch,
+			filters.AccountSearch,
 		)
 		if err != nil {
 			return nil, errors.New("failed to get group statistics")
@@ -255,7 +261,8 @@ func (h *DashboardHandler) buildSnapshotV2Response(
 
 func parseDashboardSnapshotV2Filters(c *gin.Context) (*dashboardSnapshotV2Filters, error) {
 	filters := &dashboardSnapshotV2Filters{
-		Model: strings.TrimSpace(c.Query("model")),
+		Model:         strings.TrimSpace(c.Query("model")),
+		AccountSearch: strings.TrimSpace(c.Query("account_search")),
 	}
 
 	if userIDStr := strings.TrimSpace(c.Query("user_id")); userIDStr != "" {
