@@ -29,6 +29,9 @@ func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 			return fmt.Errorf("查询缺少完整规则: %s", actual)
 		}
 		where := actual[strings.Index(actual, " WHERE "):]
+		if strings.Contains(where, "credentials") || !strings.Contains(where, `"name"`) {
+			return fmt.Errorf("受限搜索必须仅匹配公开名称: %s", where)
+		}
 		if i := strings.Index(where, " ORDER BY "); i >= 0 {
 			where = where[:i]
 		}
@@ -63,7 +66,7 @@ func TestScopedAdminAccountListScopesCountAndPageInSQL(t *testing.T) {
 		{Permissions: []string{"accounts.read"}, GroupIDs: []int64{1}, AccountTypes: []string{"oauth"}},
 		{Permissions: []string{"accounts.read"}, GroupIDs: []int64{2}, AccountTypes: []string{"apikey"}},
 	}}}
-	_, total, err := repo.ScopedAdminList(adminaccess.WithPrincipal(context.Background(), principal), pagination.PaginationParams{Page: 1, PageSize: 20}, "", "", "", "")
+	_, total, err := repo.ScopedAdminList(adminaccess.WithPrincipal(context.Background(), principal), pagination.PaginationParams{Page: 1, PageSize: 20}, "", "", "", "visible")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +116,19 @@ func TestScopedAdminAccountListPostgresRulesAndPagination(t *testing.T) {
 		{Permissions: []string{"accounts.read"}, GroupIDs: []int64{2}, AccountTypes: []string{"apikey"}, Platforms: []string{"openai"}},
 	}}}
 	ctx := adminaccess.WithPrincipal(context.Background(), principal)
+	_, err = db.Exec(`UPDATE accounts SET name='Visible Account', credentials=credentials || '{"model_whitelist":["PRIVATE_MODEL"]}'::jsonb WHERE id=1`)
+	require.NoError(t, err)
+	for _, search := range []string{"URL_SECRET", "PRIVATE_MODEL", "TOKEN_SECRET"} {
+		rows, total, listErr := repo.ScopedAdminList(ctx, pagination.DefaultPagination(), "", "", "", search)
+		require.NoError(t, listErr)
+		require.Zero(t, total, search)
+		require.Empty(t, rows, search)
+	}
+	visible, count, listErr := repo.ScopedAdminList(ctx, pagination.DefaultPagination(), "", "", "", "visible")
+	require.NoError(t, listErr)
+	require.EqualValues(t, 1, count)
+	require.Len(t, visible, 1)
+	require.EqualValues(t, 1, visible[0].ID)
 	for page, wantID := range []int64{1, 4} {
 		rows, total, listErr := repo.ScopedAdminList(ctx, pagination.PaginationParams{Page: page + 1, PageSize: 1}, "", "", "", "")
 		require.NoError(t, listErr)

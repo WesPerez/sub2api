@@ -189,6 +189,7 @@ type UserBreakdownDimension struct {
 	UserID             int64  // filter by user_id (>0 to enable)
 	APIKeyID           int64  // filter by api_key_id (>0 to enable)
 	AccountID          int64  // filter by account_id (>0 to enable)
+	AccountSearch      string // all whitespace-separated terms match account name, URL or configured models (case-insensitive)
 	RequestType        *int16 // filter by request_type (non-nil to enable)
 	Stream             *bool  // filter by stream flag (non-nil to enable)
 	NativeCompactionV2 *bool  // filter by native compaction v2 flag (non-nil to enable)
@@ -269,12 +270,13 @@ type PlatformDashboardStats struct {
 
 // UsageLogFilters represents filters for usage log queries
 type UsageLogFilters struct {
-	UserID    int64
-	APIKeyID  int64
-	AccountID int64
-	GroupID   int64
-	RequestID string
-	Model     string
+	UserID        int64
+	APIKeyID      int64
+	AccountID     int64
+	AccountSearch string
+	GroupID       int64
+	RequestID     string
+	Model         string
 	// ModelFilterSource controls how Model is matched. Empty preserves raw usage_logs.model semantics.
 	ModelFilterSource     string
 	RequestType           *int16

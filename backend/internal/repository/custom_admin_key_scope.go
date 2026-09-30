@@ -26,7 +26,11 @@ func (r *accountRepository) ScopedAdminList(ctx context.Context, p pagination.Pa
 	if len(alternatives) == 0 {
 		return []service.Account{}, 0, nil
 	}
-	q := r.accountListFilteredQuery(platform, kind, status, search, 0, "").Where(dbaccount.Or(alternatives...))
+	q := r.accountListFilteredQuery(platform, kind, status, "", 0, "").Where(dbaccount.Or(alternatives...))
+	// Scoped lists expose names, but not upstream URLs or model whitelists.
+	if search = strings.TrimSpace(search); search != "" {
+		q.Where(dbaccount.NameContainsFold(search))
+	}
 	total, err := q.Clone().Count(ctx)
 	if err != nil {
 		return nil, 0, err

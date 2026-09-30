@@ -260,6 +260,13 @@ func authenticateScopedAdminRequest(c *gin.Context, key string, settings *servic
 		AbortWithError(c, 403, "FORBIDDEN", "管理密钥未获此操作权限")
 		return
 	}
+	// Extended account search also matches private upstream configuration. Aggregate
+	// routes have no account-field scope, so scoped keys must not use that filter.
+	if strings.TrimSpace(c.Query("account_search")) != "" {
+		c.Set("admin_key_denial_reason", "account_search_not_allowed")
+		AbortWithError(c, 403, "FORBIDDEN", "受限管理密钥不能使用账号扩展搜索")
+		return
+	}
 	c.Next()
 }
 func recordAdminKeyRequest(c *gin.Context, audit *service.AuditLogService, item *service.ScopedAdminKey) {

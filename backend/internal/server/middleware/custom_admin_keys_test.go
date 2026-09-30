@@ -78,6 +78,40 @@ func TestLegacyAdminKeyCannotManageKeys(t *testing.T) {
 	require.Equal(t, 403, w.Code)
 }
 
+func TestScopedAdminKeyRejectsPrivateAccountSearch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	settings := service.NewSettingService(nil, nil)
+	settings.SetScopedAdminKeyRepository(&adminAuthKeyRepo{})
+	key, _, err := settings.CreateScopedAdminKey(context.Background(), service.ScopedAdminKeyInput{
+		Name: "统计只读", Enabled: true,
+		Policy: adminaccess.Policy{GlobalPermissions: []string{"usage.read", "dashboard.read", "ops.errors.read"}},
+	}, 9)
+	require.NoError(t, err)
+	users := service.NewUserService(&stubUserRepo{getByID: func(context.Context, int64) (*service.User, error) {
+		return &service.User{ID: 9, Role: service.RoleAdmin, Status: service.StatusActive}, nil
+	}}, nil, nil, nil)
+	r := gin.New()
+	r.Use(gin.HandlerFunc(NewAdminAuthMiddleware(nil, users, settings, nil)))
+	for _, path := range []string{
+		"/api/v1/admin/usage", "/api/v1/admin/usage/stats", "/api/v1/admin/dashboard/trend",
+		"/api/v1/admin/dashboard/models", "/api/v1/admin/dashboard/groups", "/api/v1/admin/dashboard/user-breakdown",
+		"/api/v1/admin/dashboard/snapshot-v2", "/api/v1/admin/ops/errors",
+	} {
+		r.GET(path, func(c *gin.Context) { c.Status(204) })
+		for _, query := range []string{"", "?account_search=", "?account_search=private-upstream"} {
+			req := httptest.NewRequest("GET", path+query, nil)
+			req.Header.Set("x-api-key", key)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			want := 204
+			if query == "?account_search=private-upstream" {
+				want = 403
+			}
+			require.Equal(t, want, w.Code, path+query)
+		}
+	}
+}
+
 func TestScopedAdminKeyAuditDenialOmitsSecrets(t *testing.T) {
 	repo := &auditCaptureRepository{}
 	audit := service.NewAuditLogService(repo, nil)

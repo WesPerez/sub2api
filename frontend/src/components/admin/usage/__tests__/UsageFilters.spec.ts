@@ -14,6 +14,7 @@ const messages: Record<string, string> = {
   'admin.usage.allModels': 'All Models',
   'admin.usage.account': 'Account',
   'admin.usage.searchAccountPlaceholder': 'Search account...',
+  'admin.usage.searchAccountKeywordPlaceholder': 'Account, URL or model; Enter to search',
   'usage.type': 'Type',
   'admin.usage.allTypes': 'All Types',
   'usage.ws': 'WS',
@@ -75,16 +76,17 @@ vi.mock('@/api/admin', () => ({
 
 // Default props helper
 const defaultFilters = () => ({
-  user_id: undefined,
-  api_key_id: undefined,
-  account_id: undefined,
-  model: null,
+  user_id: undefined as number | undefined,
+  api_key_id: undefined as number | undefined,
+  account_id: undefined as number | undefined,
+  account_search: undefined as string | undefined,
+  model: null as string | null,
   request_type: null,
   native_compaction_v2: null,
   billing_type: null,
   billing_mode: null,
 	upstream_model_mismatch: null,
-  group_id: null,
+  group_id: null as number | null,
   start_date: '',
   end_date: '',
 })
@@ -140,7 +142,7 @@ describe('UsageFilters — user search dropdown', () => {
     const wrapper = mountFilters()
 
     // Trigger focus (sets showUserDropdown = true) then input (fires debounceUserSearch)
-    const input = wrapper.find('input[type="text"]')
+    const input = wrapper.find('input[placeholder="Search user..."]')
     await input.trigger('focus')
     await input.setValue('test')
     await input.trigger('input')
@@ -192,7 +194,7 @@ describe('UsageFilters — user search dropdown', () => {
       .mockImplementationOnce(() => secondSearch.promise)
 
     const wrapper = mountFilters()
-    const input = wrapper.find('input[type="text"]')
+    const input = wrapper.find('input[placeholder="Search user..."]')
     await input.trigger('focus')
 
     await input.setValue('a')
@@ -218,7 +220,7 @@ describe('UsageFilters — user search dropdown', () => {
     mockSearchUsers.mockImplementationOnce(() => pendingSearch.promise)
 
     const wrapper = mountFilters()
-    const input = wrapper.find('input[type="text"]')
+    const input = wrapper.find('input[placeholder="Search user..."]')
     await input.trigger('focus')
 
     await input.setValue('stale')
@@ -232,6 +234,180 @@ describe('UsageFilters — user search dropdown', () => {
     pendingSearch.resolve([{ id: 3, email: 'stale@test.com', deleted: false }])
     await flushPromises()
     expect(wrapper.text()).not.toContain('stale@test.com')
+  })
+})
+
+describe('UsageFilters — account keyword and exact selection', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    mockAccountsList.mockReset().mockResolvedValue({ items: [] })
+  })
+  afterEach(() => vi.useRealTimers())
+
+  const accountInput = (wrapper: ReturnType<typeof mountFilters>) =>
+    wrapper.get('input[placeholder="Account, URL or model; Enter to search"]')
+
+  it('submits the keyword on Enter without selecting one of the suggestions', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 1, name: 'windhub-a' }, { id: 2, name: 'windhub-b' }] })
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue(' WindHub ')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    expect(mockAccountsList).toHaveBeenCalledWith(1, 20, { search: 'WindHub' })
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBe('WindHub')
+    expect(wrapper.props('modelValue').account_id).toBeUndefined()
+    expect((input.element as HTMLInputElement).value).toBe('WindHub')
+    expect(wrapper.emitted('change')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it.each(['ag -glm', 'hyx  -glm', '-gpt astra'])('uses the complete query %j for suggestions and usage filtering', async (query) => {
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue(` ${query} `)
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    expect(mockAccountsList).toHaveBeenCalledWith(1, 20, { search: query })
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBe(query)
+    expect(wrapper.props('modelValue').account_id).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('preserves exact selection and switches to text filtering when the name is edited', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 2351, name: 'windhub-a' }] })
+    const wrapper = mountFilters({ ...defaultFilters(), account_search: 'windhub' })
+    const input = accountInput(wrapper)
+    await input.setValue('windhub')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().includes('windhub-a'))!.trigger('click')
+    expect(wrapper.props('modelValue').account_id).toBe(2351)
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_id).toBe(2351)
+
+    await input.setValue('glm')
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_id).toBeUndefined()
+    expect(wrapper.props('modelValue').account_search).toBe('glm')
+    expect((input.element as HTMLInputElement).value).toBe('glm')
+    await wrapper.get('button[aria-label="Clear account filter"]').trigger('click')
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    expect((input.element as HTMLInputElement).value).toBe('')
+    wrapper.unmount()
+  })
+
+  it('commits edited account text when moving to another filter and preserves the other criteria', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 2351, name: 'old-account' }] })
+    const wrapper = mountFilters({ ...defaultFilters(), user_id: 7, api_key_id: 9, model: 'gpt-6-astra', group_id: 11 })
+    const input = accountInput(wrapper)
+    expect(wrapper.findAll('input')[0].element).toBe(input.element)
+    await input.setValue('old')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().includes('old-account'))!.trigger('click')
+    await input.setValue('new-site')
+    await input.trigger('focusout', { relatedTarget: wrapper.get('input[placeholder="Search user..."]').element })
+    expect(wrapper.props('modelValue')).toEqual(expect.objectContaining({
+      account_id: undefined, account_search: 'new-site', user_id: 7, api_key_id: 9,
+      model: 'gpt-6-astra', group_id: 11, start_date: '2026-05-01', end_date: '2026-05-28',
+    }))
+    wrapper.unmount()
+  })
+
+  it('lets a suggestion click select an exact account without submitting the draft on blur', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 2351, name: 'selected-account' }] })
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue('selected')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    const suggestion = wrapper.findAll('button').find(button => button.text().includes('selected-account'))!
+    const mouseDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true })
+    suggestion.element.dispatchEvent(mouseDown)
+    expect(mouseDown.defaultPrevented).toBe(true)
+    await input.trigger('focusout', { relatedTarget: suggestion.element })
+    expect(wrapper.emitted('change')).toBeUndefined()
+    await suggestion.trigger('click')
+    expect(wrapper.props('modelValue').account_id).toBe(2351)
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    expect(wrapper.emitted('change')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('commits the account draft when keyboard focus leaves via the clear button', async () => {
+    const wrapper = mountFilters({
+      ...defaultFilters(), account_id: 2351, user_id: 7, api_key_id: 9,
+      model: 'gpt-6-astra', group_id: 11,
+    })
+    const input = accountInput(wrapper)
+    await input.setValue('new-site')
+    const clear = wrapper.get('button[aria-label="Clear account filter"]')
+    await input.trigger('focusout', { relatedTarget: clear.element })
+    expect(wrapper.emitted('change')).toBeUndefined()
+    await clear.trigger('focusout', { relatedTarget: wrapper.get('input[placeholder="Search user..."]').element })
+    expect(wrapper.props('modelValue')).toEqual(expect.objectContaining({
+      account_id: undefined, account_search: 'new-site', user_id: 7, api_key_id: 9,
+      model: 'gpt-6-astra', group_id: 11, start_date: '2026-05-01', end_date: '2026-05-28',
+    }))
+    expect(wrapper.emitted('change')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('ignores stale suggestions after a newer search or an Enter submission', async () => {
+    const first = deferred<{ items: Array<{ id: number; name: string }> }>()
+    const second = deferred<{ items: Array<{ id: number; name: string }> }>()
+    mockAccountsList.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue('old')
+    vi.advanceTimersByTime(300)
+    await input.setValue('current')
+    vi.advanceTimersByTime(300)
+    second.resolve({ items: [{ id: 2, name: 'current-account' }] })
+    await flushPromises()
+    expect(wrapper.text()).toContain('current-account')
+    await input.trigger('keydown', { key: 'Enter' })
+    first.resolve({ items: [{ id: 1, name: 'old-account' }] })
+    await flushPromises()
+    await input.trigger('focus')
+    expect(wrapper.text()).not.toContain('old-account')
+    expect(wrapper.props('modelValue').account_search).toBe('current')
+    wrapper.unmount()
+  })
+
+  it('supports no-match keywords, clearing and parent reset while respecting IME composition', async () => {
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue('不存在')
+    await input.trigger('keydown', { key: 'Enter', isComposing: true })
+    expect(wrapper.emitted('change')).toBeUndefined()
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBe('不存在')
+    await input.setValue('')
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    await input.setValue('draft')
+    await wrapper.setProps({ modelValue: defaultFilters() })
+    expect((input.element as HTMLInputElement).value).toBe('')
+    vi.advanceTimersByTime(300)
+    expect(mockAccountsList).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('keeps keyword submission disabled in cleanup filters', async () => {
+    const wrapper = mountFilters()
+    await wrapper.setProps({ allowAccountSearch: false })
+    const input = wrapper.get('input[placeholder="Search account..."]')
+    await input.setValue('windhub')
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    expect(wrapper.emitted('change')).toBeUndefined()
+    wrapper.unmount()
   })
 })
 
