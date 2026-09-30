@@ -560,6 +560,84 @@ func TestAccountTestService_OpenAIAPIKeyResponsesUsesCodexProbeHeaders(t *testin
 	req := upstream.requests[0]
 	require.Equal(t, "https://compat-upstream.example/v1/responses", req.URL.String())
 	requireOpenAICodexProbeHeaders(t, req.Header)
+	body, err := io.ReadAll(req.Body)
+	require.NoError(t, err)
+	require.False(t, gjson.GetBytes(body, "include").Exists())
+	require.False(t, gjson.GetBytes(body, "prompt_cache_key").Exists())
+}
+
+func TestAccountTestService_OpenAIAPIKeyAnyRouterAddsCodexRequestFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := newTestContext()
+
+	resp := newJSONResponse(http.StatusOK, "")
+	resp.Body = io.NopCloser(strings.NewReader("data: {\"type\":\"response.completed\"}\n\n"))
+	upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
+	svc := &AccountTestService{
+		httpUpstream: upstream,
+		cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+	}
+	account := &Account{
+		ID:          96,
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "https://anyrouter.top/v1",
+		},
+		Extra: map[string]any{openai_compat.ExtraKeyResponsesSupported: true},
+	}
+
+	err := svc.testOpenAIAccountConnection(ctx, account, "gpt-5.6-sol", "", "")
+	require.NoError(t, err)
+	require.Len(t, upstream.requests, 1)
+	body, err := io.ReadAll(upstream.requests[0].Body)
+	require.NoError(t, err)
+	require.Equal(t, "reasoning.encrypted_content", gjson.GetBytes(body, "include.0").String())
+	require.Equal(t, openAIAccountTestPromptCacheKey, gjson.GetBytes(body, "prompt_cache_key").String())
+	require.False(t, gjson.GetBytes(body, "store").Exists())
+}
+
+func TestAccountTestService_ConnectionPromptIsOpenAIOnly(t *testing.T) {
+	for _, platform := range []string{PlatformOpenAI, PlatformKimi} {
+		for _, responses := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/responses=%t", platform, responses), func(t *testing.T) {
+				ctx, _ := newTestContext()
+				responseBody := "data: {\"type\":\"response.completed\"}\n\n"
+				if !responses {
+					responseBody = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+				}
+				resp := newJSONResponse(http.StatusOK, responseBody)
+				resp.Header.Set("Content-Type", "text/event-stream")
+				upstream := &queuedHTTPUpstream{responses: []*http.Response{resp}}
+				svc := &AccountTestService{
+					httpUpstream: upstream,
+					cfg:          &config.Config{Security: config.SecurityConfig{URLAllowlist: config.URLAllowlistConfig{Enabled: false}}},
+				}
+				account := &Account{
+					ID: 97, Platform: platform, Type: AccountTypeAPIKey, Concurrency: 1,
+					Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://compat-upstream.example/v1"},
+					Extra:       map[string]any{openai_compat.ExtraKeyResponsesSupported: responses},
+				}
+				require.NoError(t, svc.testOpenAIAccountConnection(ctx, account, "test-model", "", ""))
+				require.Len(t, upstream.requests, 1)
+				body, err := io.ReadAll(upstream.requests[0].Body)
+				require.NoError(t, err)
+				promptPath, effortPath := "input.0.content.0.text", "reasoning.effort"
+				if !responses {
+					promptPath, effortPath = "messages.0.content", "reasoning_effort"
+				}
+				if platform == PlatformOpenAI {
+					require.Equal(t, openAIAccountTestPrompt, gjson.GetBytes(body, promptPath).String())
+					require.Equal(t, "high", gjson.GetBytes(body, effortPath).String())
+				} else {
+					require.Equal(t, "hi", gjson.GetBytes(body, promptPath).String())
+					require.False(t, gjson.GetBytes(body, effortPath).Exists())
+				}
+			})
+		}
+	}
 }
 
 func TestAccountTestService_OpenAIAPIKeyResponsesUnsupportedUsesChatCompletionsPath(t *testing.T) {
