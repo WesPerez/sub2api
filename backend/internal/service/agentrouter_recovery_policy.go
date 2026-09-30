@@ -117,6 +117,14 @@ func recoveryIdentity(a *Account) string {
 		a.ID, a.Name, a.Platform, a.Type, a.Credentials, a.GroupIDs, a.ProxyID, a.Extra[IntegrationBalanceKey]})
 }
 
+// Balance refreshes do not change which account should be reset. They are
+// still checked separately before opening a selected account.
+func recoveryResetIdentity(a *Account) string {
+	copy := *a
+	copy.Extra = nil
+	return recoveryIdentity(&copy)
+}
+
 func recoverySiteAccount(a *Account) bool {
 	base, ok := a.Credentials["base_url"].(string)
 	if !ok || a.ParentAccountID != nil || a.Type != AccountTypeAPIKey {
@@ -183,14 +191,16 @@ func BuildRecoveryPlan(p RecoveryPolicy, accounts []Account) (RecoveryPlan, erro
 		seen[a.ID] = true
 		name := strings.ToLower(a.Name)
 		suffix := name[strings.LastIndex(name, "-")+1:]
-		c := RecoveryCandidate{ID: a.ID, Name: a.Name, Platform: a.Platform, Group: aliases[suffix], Balance: recoveryAccountBalance(a, p.BalanceMaxAgeHours), Schedulable: a.Schedulable, Action: "preserve", identity: recoveryIdentity(a)}
-		if _, state := AccountIntegrationBalance(a); state != "legacy" && c.Balance == nil {
-			c.Reason = "余额快照已失效或过期，保持原开关并等待刷新"
-		}
+		c := RecoveryCandidate{ID: a.ID, Name: a.Name, Platform: a.Platform, Group: aliases[suffix], Balance: recoveryAccountBalance(a, p.BalanceMaxAgeHours), Schedulable: a.Schedulable, Action: "preserve", identity: recoveryIdentity(a), resetIdentity: recoveryResetIdentity(a)}
 		if c.Group == "" {
 			c.Reason = "未匹配类型后缀，保持原开关"
 		} else if a.Status != StatusActive && a.Status != StatusError {
 			c.Reason = "账号已由管理员停用，保持原状态"
+		} else {
+			c.Action = "disable"
+			if c.Balance == nil {
+				c.Reason = "余额未识别、失效或过期，恢复账号并关闭调度，等待刷新"
+			}
 		}
 		plan.Accounts = append(plan.Accounts, c)
 	}
@@ -208,13 +218,13 @@ func BuildRecoveryPlan(p RecoveryPolicy, accounts []Account) (RecoveryPlan, erro
 				continue
 			}
 			gp.Matched++
-			if c.Reason == "" && c.Balance != nil {
+			if c.Action == "disable" && c.Balance != nil {
 				eligible = append(eligible, i)
 			}
 		}
 		gp.Eligible = len(eligible)
 		if len(eligible) == 0 {
-			plan.Warnings = append(plan.Warnings, g.Label+"：未匹配到可用余额，保留该类原开关")
+			plan.Warnings = append(plan.Warnings, g.Label+"：未匹配到可用余额，恢复候选账号并关闭调度，本轮不开放")
 		} else {
 			sort.Slice(eligible, func(i, j int) bool {
 				a, b := plan.Accounts[eligible[i]], plan.Accounts[eligible[j]]
@@ -225,15 +235,6 @@ func BuildRecoveryPlan(p RecoveryPolicy, accounts []Account) (RecoveryPlan, erro
 				}
 				return da.GreaterThan(db)
 			})
-			for i := range plan.Accounts {
-				c := &plan.Accounts[i]
-				if c.Group == g.ID && c.Reason == "" {
-					c.Action = "disable"
-					if c.Balance == nil {
-						c.Reason = "余额未识别，本轮不入选"
-					}
-				}
-			}
 			for i, index := range eligible {
 				if i >= g.TopN {
 					break

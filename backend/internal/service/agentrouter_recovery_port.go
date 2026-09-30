@@ -41,15 +41,16 @@ type RecoveryPolicyView struct {
 
 // RecoveryCandidate deliberately excludes credentials, notes and proxy secrets.
 type RecoveryCandidate struct {
-	ID          int64   `json:"id"`
-	Name        string  `json:"name"`
-	Platform    string  `json:"platform"`
-	Group       string  `json:"group"`
-	Balance     *string `json:"balance"`
-	Schedulable bool    `json:"schedulable"`
-	Action      string  `json:"action"`
-	Reason      string  `json:"reason,omitempty"`
-	identity    string
+	ID            int64   `json:"id"`
+	Name          string  `json:"name"`
+	Platform      string  `json:"platform"`
+	Group         string  `json:"group"`
+	Balance       *string `json:"balance"`
+	Schedulable   bool    `json:"schedulable"`
+	Action        string  `json:"action"`
+	Reason        string  `json:"reason,omitempty"`
+	identity      string
+	resetIdentity string
 }
 
 type RecoveryGroupPlan struct {

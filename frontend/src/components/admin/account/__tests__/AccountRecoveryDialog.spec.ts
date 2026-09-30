@@ -11,7 +11,7 @@ const config = () => ({ policy: policy(), revision: 'config-one', next_run_at: n
 const plan = () => ({ revision: 'preview-one', matched: 4, selected: 3, warnings: ['一个账号余额未识别'],
   groups: [{ id: 'glm', label: 'GLM', matched: 4, selected: [1, 2, 3] }], accounts: [] })
 const result = () => ({ id: 1, status: 'success', trigger: 'manual', started_at: '2026-09-22T14:00:00Z',
-  finished_at: '2026-09-22T14:00:01Z', outcome: { enabled: [1, 2, 3], disabled: [4], errors: [] } })
+  finished_at: '2026-09-22T14:00:01Z', outcome: { recovered: [1, 2, 3, 4], enabled: [1, 2, 3], disabled: [4], errors: [] } })
 
 async function open() {
   const wrapper = mount(AccountRecoveryDialog, { props: { show: false }, global: { stubs: {
@@ -89,6 +89,13 @@ describe('AccountRecoveryDialog', () => {
     await flushPromises()
     expect(wrapper.find('[role="alert"]').text()).toContain('其他窗口')
     expect((wrapper.find('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('reports all recovered accounts separately from accounts left enabled', async () => {
+    api.history.mockResolvedValue([result()])
+    const wrapper = await open()
+    expect(wrapper.find('[aria-label="最近执行记录"]').text()).toContain('恢复 4 个，开放 3 个，关闭 1 个')
     wrapper.unmount()
   })
 })

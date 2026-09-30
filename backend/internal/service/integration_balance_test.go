@@ -84,7 +84,7 @@ func TestIntegrationBalanceRejectsMalformedAndFutureSamples(t *testing.T) {
 	}
 }
 
-func TestRecoveryUsesManagedBalanceAndPreservesInvalidOrStaleAccounts(t *testing.T) {
+func TestRecoveryUsesManagedBalanceAndDisablesInvalidOrStaleAccounts(t *testing.T) {
 	notes := "METAPI余额 99999 / 99999"
 	a := Account{ID: 1, Name: "fixture-gpt", Type: AccountTypeAPIKey, Platform: PlatformOpenAI, Status: StatusActive,
 		Credentials: map[string]any{"base_url": "https://agentrouter.org/v1", "api_key": "fixture"}, Notes: &notes}
@@ -104,7 +104,7 @@ func TestRecoveryUsesManagedBalanceAndPreservesInvalidOrStaleAccounts(t *testing
 	require.NotEqual(t, before, recoveryIdentity(&a))
 	plan, err := BuildRecoveryPlan(DefaultRecoveryPolicy(), []Account{a})
 	require.NoError(t, err)
-	require.Equal(t, "preserve", plan.Accounts[0].Action)
+	require.Equal(t, "disable", plan.Accounts[0].Action)
 	require.Nil(t, plan.Accounts[0].Balance)
 	a.Credentials["api_key"] = "other"
 	require.Nil(t, recoveryAccountBalance(&a, 168))

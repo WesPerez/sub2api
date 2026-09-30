@@ -11,7 +11,9 @@ type ConditionalAccountRecoveryRepository interface {
 }
 
 // ApplyScheduledRecovery is the account-state boundary for scheduled API-key
-// recovery. OAuth lifecycle stays with its own refresh/recovery services.
+// recovery. Both enabled and disabled accounts have their errors cleared;
+// enabled controls only the final scheduling switch. OAuth lifecycle stays
+// with its own refresh/recovery services.
 func (s *RateLimitService) ApplyScheduledRecovery(ctx context.Context, expected *Account, enabled bool) (bool, error) {
 	if expected == nil || expected.Type != AccountTypeAPIKey {
 		return false, errors.New("scheduled recovery requires an API-key account")
@@ -24,14 +26,12 @@ func (s *RateLimitService) ApplyScheduledRecovery(ctx context.Context, expected 
 	if err != nil || !changed {
 		return changed, err
 	}
-	if enabled {
-		if s.tempUnschedCache != nil {
-			if err := s.tempUnschedCache.DeleteTempUnsched(ctx, expected.ID); err != nil {
-				slog.Warn("scheduled_recovery_cache_delete_failed", "account_id", expected.ID)
-			}
+	if s.tempUnschedCache != nil {
+		if err := s.tempUnschedCache.DeleteTempUnsched(ctx, expected.ID); err != nil {
+			slog.Warn("scheduled_recovery_cache_delete_failed", "account_id", expected.ID)
 		}
-		s.ResetOpenAI403Counter(ctx, expected.ID)
-		s.notifyAccountSchedulingBlockCleared(expected.ID)
 	}
+	s.ResetOpenAI403Counter(ctx, expected.ID)
+	s.notifyAccountSchedulingBlockCleared(expected.ID)
 	return true, nil
 }

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"sort"
 	"sync"
 	"time"
 
@@ -166,61 +165,73 @@ func (s *AgentRouterRecoveryService) Run(ctx context.Context, slot *time.Time, r
 	addError := func(id int64, stage, message string) {
 		run.Outcome.Errors = append(run.Outcome.Errors, RecoveryAccountError{ID: id, Stage: stage, Message: message})
 	}
-	ordered := append([]RecoveryCandidate(nil), plan.Accounts...)
-	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Action == "enable" && ordered[j].Action != "enable" })
-	opened := map[string]int{}
-	selected := map[string]int{}
-	for _, group := range plan.Groups {
-		selected[group.ID] = len(group.Selected)
+	// Reset every managed candidate before opening any selected account. A failed
+	// reset blocks new openings in that group, but never blocks other resets.
+	recovered := map[int64]bool{}
+	enabled := map[int64]bool{}
+	failedGroups := map[string]bool{}
+phases:
+	for _, enable := range []bool{false, true} {
+		for _, candidate := range plan.Accounts {
+			if candidate.Action == "preserve" || (enable && candidate.Action != "enable") {
+				continue
+			}
+			if enable && failedGroups[candidate.Group] {
+				addError(candidate.ID, "schedule", "该类账号未全部恢复并关闭调度，本轮不开放")
+				continue
+			}
+			if err = ctx.Err(); err != nil {
+				break phases
+			}
+			if err = lease.Check(ctx); err != nil {
+				break phases
+			}
+			current, readErr := s.accounts.GetByID(ctx, candidate.ID)
+			if readErr != nil || current == nil {
+				failedGroups[candidate.Group] = true
+				addError(candidate.ID, "identity", "无法核对账号，已跳过")
+				continue
+			}
+			if recoveryResetIdentity(current) != candidate.resetIdentity ||
+				(enable && parseBalanceIdentity(current, view.Policy.BalanceMaxAgeHours) != candidate.BalanceValue()) {
+				failedGroups[candidate.Group] = true
+				addError(candidate.ID, "identity", "账号身份或余额已变化，已跳过")
+				continue
+			}
+			// Never restore administrator-disabled accounts or erase a new failure
+			// observed after this run's reset phase.
+			if (current.Status != StatusActive && current.Status != StatusError) ||
+				(enable && (!recovered[candidate.ID] || current.Status != StatusActive || current.Schedulable || hasRecoverableRuntimeState(current))) {
+				failedGroups[candidate.Group] = true
+				addError(candidate.ID, "identity", "账号状态在操作前发生变化，已跳过")
+				continue
+			}
+			if err = lease.Check(ctx); err != nil {
+				break phases
+			}
+			changed, applyErr := s.states.ApplyScheduledRecovery(ctx, current, enable)
+			if applyErr != nil {
+				failedGroups[candidate.Group] = true
+				addError(candidate.ID, "schedule", "恢复状态或更新调度失败")
+				continue
+			}
+			if !changed {
+				failedGroups[candidate.Group] = true
+				addError(candidate.ID, "identity", "账号在操作前发生变化，已跳过")
+				continue
+			}
+			if enable {
+				enabled[candidate.ID] = true
+				run.Outcome.Enabled = append(run.Outcome.Enabled, candidate.ID)
+			} else {
+				recovered[candidate.ID] = true
+				run.Outcome.Recovered = append(run.Outcome.Recovered, candidate.ID)
+			}
+		}
 	}
-	for _, candidate := range ordered {
-		if candidate.Action == "preserve" {
-			continue
-		}
-		if candidate.Action == "disable" && opened[candidate.Group] < selected[candidate.Group] {
-			addError(candidate.ID, "schedule", "该类入选账号未全部开放，保留原开关")
-			continue
-		}
-		if err = ctx.Err(); err != nil {
-			break
-		}
-		if err = lease.Check(ctx); err != nil {
-			break
-		}
-		current, readErr := s.accounts.GetByID(ctx, candidate.ID)
-		if readErr != nil || current == nil {
-			addError(candidate.ID, "identity", "无法核对账号，已跳过")
-			continue
-		}
-		if recoveryIdentity(current) != candidate.identity || parseBalanceIdentity(current, view.Policy.BalanceMaxAgeHours) != candidate.BalanceValue() {
-			addError(candidate.ID, "identity", "账号身份或余额已变化，已跳过")
-			continue
-		}
-		// Never clear a manually disabled account's state after the preview.
-		if current.Status != StatusActive && current.Status != StatusError {
-			addError(candidate.ID, "identity", "账号已被停用，已跳过")
-			continue
-		}
-		if err = lease.Check(ctx); err != nil {
-			break
-		}
-		changed, applyErr := s.states.ApplyScheduledRecovery(ctx, current, candidate.Action == "enable")
-		if applyErr != nil {
-			addError(candidate.ID, "schedule", "恢复状态或更新调度失败")
-			continue
-		}
-		if !changed {
-			addError(candidate.ID, "identity", "账号在操作前发生变化，已跳过")
-			continue
-		}
-		if candidate.Action == "enable" {
-			run.Outcome.Recovered = append(run.Outcome.Recovered, candidate.ID)
-		}
-		if candidate.Action == "enable" {
-			opened[candidate.Group]++
-			run.Outcome.Enabled = append(run.Outcome.Enabled, candidate.ID)
-		} else {
-			run.Outcome.Disabled = append(run.Outcome.Disabled, candidate.ID)
+	for _, id := range run.Outcome.Recovered {
+		if !enabled[id] {
+			run.Outcome.Disabled = append(run.Outcome.Disabled, id)
 		}
 	}
 	run.Status = "success"

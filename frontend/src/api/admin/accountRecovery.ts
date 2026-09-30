@@ -14,7 +14,7 @@ export interface RecoveryPlan {
 }
 export interface RecoveryRun {
   id: number; trigger: string; status: string; started_at: string; finished_at: string | null; error?: string; warning?: string
-  outcome: { enabled: number[]; disabled: number[]; errors: { id: number; stage: string; message: string }[]; plan?: RecoveryPlan }
+  outcome: { recovered: number[]; enabled: number[]; disabled: number[]; errors: { id: number; stage: string; message: string }[]; plan?: RecoveryPlan }
 }
 const base = '/admin/agentrouter-recovery'
 export const accountRecovery = {

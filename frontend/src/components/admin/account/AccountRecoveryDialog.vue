@@ -1,7 +1,7 @@
 <template>
   <BaseDialog :show="show" title="AgentRouter · 定时开放账号" width="extra-wide" @close="close">
     <div class="recovery-panel">
-      <p class="text-sm text-gray-500">每次按已同步的余额从高到低选取各类账号。余额过期或账号身份变化时保持原开关，等待刷新。更改配置前可核对实际账号。</p>
+      <p class="text-sm text-gray-500">每次先将已归类的候选账号恢复正常并关闭调度，再按已同步余额从高到低开放各类前几个。余额缺失或过期的账号恢复后保持调度关闭；管理员停用或身份变化的账号会跳过。</p>
       <p v-if="error" role="alert" class="rounded-lg bg-red-50 p-3 text-red-700">{{ error }}</p>
       <p v-if="notice" role="status" class="rounded-lg bg-green-50 p-3 text-green-700">{{ notice }}</p>
       <p v-if="loading">正在读取计划与执行记录…</p>
@@ -50,7 +50,7 @@
           <p v-if="!runs.length" class="text-sm text-gray-500">尚无应用内执行记录，开启后将在下次计划执行。</p>
           <details v-for="run in runs" :key="run.id" class="recovery-group">
             <summary>{{ at(run.started_at) }} · {{ statusText[run.status] || run.status }} · {{ run.trigger === 'manual' ? '手动' : '定时' }}</summary>
-            <p class="mt-3 text-sm">开放 {{ run.outcome.enabled?.length || 0 }} 个，关闭 {{ run.outcome.disabled?.length || 0 }} 个。</p>
+            <p class="mt-3 text-sm">恢复 {{ run.outcome.recovered?.length || 0 }} 个，开放 {{ run.outcome.enabled?.length || 0 }} 个，关闭 {{ run.outcome.disabled?.length || 0 }} 个。</p>
             <p v-if="run.finished_at" class="text-xs text-gray-500">耗时 {{ Math.max(0, Math.round((Date.parse(run.finished_at) - Date.parse(run.started_at)) / 1000)) }} 秒</p>
             <p v-if="run.error" class="text-red-600">{{ run.error }}</p>
             <p v-for="item in run.outcome.errors || []" :key="item.id + item.stage" class="text-sm text-amber-700">账号 {{ item.id }}：{{ item.message }}</p>
@@ -74,7 +74,7 @@
     <p>关闭后将放弃尚未保存的配置。</p><template #footer><button class="btn btn-secondary" @click="confirmDiscard = false">继续编辑</button><button class="btn btn-danger" @click="confirmDiscard = false; emit('close')">放弃并关闭</button></template>
   </BaseDialog>
   <BaseDialog :show="confirmRun" title="确认执行账号恢复" width="narrow" :z-index="60" @close="confirmRun = false">
-    <p>将按刚才核对的结果恢复并开放 {{ plan?.selected }} 个账号，同类其他候选关闭调度。不修改平台、分组和消费记录。</p><template #footer><button class="btn btn-secondary" @click="confirmRun = false">取消</button><button class="btn btn-primary" @click="runNow">确认执行</button></template>
+    <p>将先恢复全部可管理候选账号并关闭调度，再按刚才核对的余额排名开放 {{ plan?.selected }} 个账号。</p><template #footer><button class="btn btn-secondary" @click="confirmRun = false">取消</button><button class="btn btn-primary" @click="runNow">确认执行</button></template>
   </BaseDialog>
 </template>
 
@@ -88,7 +88,7 @@ const saved = ref<RecoveryConfig | null>(null), draft = ref<RecoveryPolicy | nul
 const runs = ref<RecoveryRun[]>([]), loading = ref(false), busy = ref(false), error = ref(''), notice = ref('')
 const confirmDiscard = ref(false), confirmRun = ref(false), scheduleMode = ref('hourly')
 const dirty = computed(() => !!draft.value && JSON.stringify(draft.value) !== JSON.stringify(saved.value?.policy))
-const actionText: Record<string, string> = { enable: '开放', disable: '关闭调度', preserve: '保持原样' }
+const actionText: Record<string, string> = { enable: '恢复后择优开放', disable: '恢复并关闭调度', preserve: '保持原样' }
 const statusText: Record<string, string> = { running: '执行中', success: '成功', partial: '部分完成', failed: '失败', interrupted: '已中断' }
 const at = (value: string) => new Date(value).toLocaleString('zh-CN', { timeZone: saved.value?.policy.timezone || 'Asia/Shanghai', hour12: false })
 function apply(value: RecoveryConfig) { saved.value = value; draft.value = structuredClone(value.policy); scheduleMode.value = value.policy.cron === '0 * * * *' ? 'hourly' : value.policy.cron === '0 0 * * *' ? 'daily' : 'custom' }
