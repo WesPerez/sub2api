@@ -75,8 +75,9 @@ const DataTableStub = {
           <slot :name="'header-' + column.key" :column="column" />
         </div>
       </template>
-      <div v-for="row in data" :key="row.id" data-test="account-rate">
-        <slot name="cell-rate_multiplier" :row="row" />
+      <div v-for="row in data" :key="row.id">
+        <div data-test="account-model"><slot name="cell-model_config" :row="row" /></div>
+        <div data-test="account-rate"><slot name="cell-rate_multiplier" :row="row" /></div>
       </div>
     </div>
   `
@@ -235,5 +236,40 @@ describe('admin AccountsView usage windows hint', () => {
     expect(wrapper.get('[data-test="account-rate"]').text()).toBe('0.065x')
     const indicator = wrapper.get('[data-testid="account-rate-sync-indicator"]')
     expect(indicator.attributes('title')).toBe('admin.accounts.upstreamBilling.syncedRateTooltip')
+  })
+
+  it('shows the configured model whitelist and mappings in the account table', async () => {
+    listAccounts.mockResolvedValueOnce({
+      items: [{
+        id: 8,
+        name: 'model-account',
+        platform: 'openai',
+        type: 'apikey',
+        status: 'active',
+        schedulable: true,
+        rate_multiplier: 1,
+        credentials: {
+          model_mapping: {
+            'gpt-5.6-sol': 'gpt-5.6-sol',
+            'review-model': 'gpt-5.6-terra'
+          }
+        },
+        extra: {},
+        created_at: '2026-08-08T00:00:00Z',
+        updated_at: '2026-08-08T00:00:00Z'
+      }],
+      total: 1,
+      page: 1,
+      page_size: 20,
+      pages: 1
+    })
+
+    const wrapper = mountView()
+    await flushPromises()
+
+    const columns = wrapper.getComponent(DataTableStub).props('columns') as Array<{ key: string }>
+    expect(columns.some(column => column.key === 'model_config')).toBe(true)
+    expect(wrapper.get('[data-test="account-model"]').text()).toContain('gpt-5.6-sol')
+    expect(wrapper.get('[data-test="account-model"]').text()).toContain('review-model -> gpt-5.6-terra')
   })
 })

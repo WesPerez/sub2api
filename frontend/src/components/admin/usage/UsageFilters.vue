@@ -91,12 +91,13 @@
             v-model="accountKeyword"
             type="text"
             class="input pr-8"
-            :placeholder="t('admin.usage.searchAccountPlaceholder')"
+            :placeholder="t(allowAccountSearch ? 'admin.usage.searchAccountKeywordPlaceholder' : 'admin.usage.searchAccountPlaceholder')"
             @input="debounceAccountSearch"
             @focus="showAccountDropdown = true"
+            @keydown.enter.prevent="submitAccountSearch"
           />
           <button
-            v-if="filters.account_id"
+            v-if="accountKeyword || filters.account_id || filters.account_search"
             type="button"
             @click="clearAccount"
             class="absolute right-2 top-9 text-gray-400"
@@ -215,6 +216,7 @@ interface Props {
   endDate: string
   showActions?: boolean
   modelOptions?: string[]
+  allowAccountSearch?: boolean
   /**
    * errors 模式:隐藏用量专属字段/按钮,显示错误类型+状态码(错误请求 tab 用)
    * ranking 模式:同 usage 但隐藏计费模式筛选与清理/导出按钮(用户排行 tab 用)
@@ -226,6 +228,7 @@ interface Props {
 
 const props = withDefaults(defineProps<Props>(), {
   showActions: true,
+  allowAccountSearch: true,
   mode: 'usage',
   flat: false
 })
@@ -264,6 +267,8 @@ const accountKeyword = ref('')
 const accountResults = ref<SimpleAccount[]>([])
 const showAccountDropdown = ref(false)
 let accountSearchTimeout: ReturnType<typeof setTimeout> | null = null
+let accountSearchSequence = 0
+let selectedAccountName = ''
 
 const modelOptions = computed<SelectOption[]>(() => [
   { value: null, label: t('admin.usage.allModels') },
@@ -423,34 +428,71 @@ const onClearApiKey = () => {
   emitChange()
 }
 
+const clearPendingAccountSearch = () => {
+  if (accountSearchTimeout) {
+    clearTimeout(accountSearchTimeout)
+    accountSearchTimeout = null
+  }
+  accountSearchSequence += 1
+}
+
 const debounceAccountSearch = () => {
-  if (accountSearchTimeout) clearTimeout(accountSearchTimeout)
+  clearPendingAccountSearch()
+  accountResults.value = []
+  const query = accountKeyword.value.trim()
+  if (!query) {
+    clearAccount()
+    return
+  }
+  showAccountDropdown.value = true
+  const sequence = accountSearchSequence
   accountSearchTimeout = setTimeout(async () => {
-    if (!accountKeyword.value) {
-      accountResults.value = []
-      return
-    }
+    accountSearchTimeout = null
     try {
-      const res = await adminAPI.accounts.list(1, 20, { search: accountKeyword.value })
-      accountResults.value = res.items.map((a) => ({ id: a.id, name: a.name }))
+      const res = await adminAPI.accounts.list(1, 20, { search: query })
+      if (sequence === accountSearchSequence) {
+        accountResults.value = res.items.map((a) => ({ id: a.id, name: a.name }))
+      }
     } catch {
-      accountResults.value = []
+      if (sequence === accountSearchSequence) accountResults.value = []
     }
   }, 300)
 }
 
-const selectAccount = (a: SimpleAccount) => {
-  accountKeyword.value = a.name
+const submitAccountSearch = (event: KeyboardEvent) => {
+  if (!props.allowAccountSearch || event.isComposing) return
+  clearPendingAccountSearch()
+  accountResults.value = []
   showAccountDropdown.value = false
+  const keyword = accountKeyword.value.trim()
+  accountKeyword.value = keyword
+  if (!filters.value.account_id || keyword !== selectedAccountName) {
+    filters.value.account_id = undefined
+    filters.value.account_search = keyword || undefined
+    selectedAccountName = ''
+  }
+  emitChange()
+}
+
+const selectAccount = (a: SimpleAccount) => {
+  clearPendingAccountSearch()
+  accountKeyword.value = a.name
+  selectedAccountName = a.name
+  accountResults.value = []
+  showAccountDropdown.value = false
+  filters.value.account_search = undefined
   filters.value.account_id = a.id
   emitChange()
 }
 
 const clearAccount = () => {
+  clearPendingAccountSearch()
   accountKeyword.value = ''
+  selectedAccountName = ''
   accountResults.value = []
   showAccountDropdown.value = false
   filters.value.account_id = undefined
+  filters.value.account_search = undefined
   emitChange()
 }
 
@@ -513,13 +555,17 @@ watch(
 )
 
 watch(
-  () => filters.value.account_id,
-  (accountId) => {
+  () => [filters.value.account_id, filters.value.account_search],
+  ([accountId, accountSearch]) => {
     if (!accountId) {
-      accountKeyword.value = ''
+      clearPendingAccountSearch()
+      accountKeyword.value = accountSearch || ''
+      selectedAccountName = ''
       accountResults.value = []
+      showAccountDropdown.value = false
     }
-  }
+  },
+  { immediate: true }
 )
 
 onMounted(async () => {
@@ -534,6 +580,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   clearPendingUserSearch()
+  clearPendingAccountSearch()
   document.removeEventListener('click', onDocumentClick)
 })
 
