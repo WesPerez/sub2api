@@ -1074,8 +1074,10 @@ func (r *accountRepository) accountListFilteredQuery(platform, accountType, stat
 			q = q.Where(dbaccount.StatusEQ(status))
 		}
 	}
-	if search != "" {
-		q = q.Where(dbaccount.NameContainsFold(search))
+	if search = strings.TrimSpace(search); search != "" {
+		q = q.Where(func(s *entsql.Selector) {
+			s.Where(accountSearchPredicate(s.C(dbaccount.FieldName), s.C(dbaccount.FieldCredentials), search))
+		})
 	}
 	if groupID == service.AccountListGroupUngrouped {
 		q = q.Where(dbaccount.Not(dbaccount.HasAccountGroups()))

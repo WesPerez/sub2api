@@ -14,6 +14,7 @@ const messages: Record<string, string> = {
   'admin.usage.allModels': 'All Models',
   'admin.usage.account': 'Account',
   'admin.usage.searchAccountPlaceholder': 'Search account...',
+  'admin.usage.searchAccountKeywordPlaceholder': 'Account, URL or model; Enter to search',
   'usage.type': 'Type',
   'admin.usage.allTypes': 'All Types',
   'usage.ws': 'WS',
@@ -77,7 +78,8 @@ vi.mock('@/api/admin', () => ({
 const defaultFilters = () => ({
   user_id: undefined,
   api_key_id: undefined,
-  account_id: undefined,
+  account_id: undefined as number | undefined,
+  account_search: undefined as string | undefined,
   model: null,
   request_type: null,
   native_compaction_v2: null,
@@ -232,6 +234,110 @@ describe('UsageFilters — user search dropdown', () => {
     pendingSearch.resolve([{ id: 3, email: 'stale@test.com', deleted: false }])
     await flushPromises()
     expect(wrapper.text()).not.toContain('stale@test.com')
+  })
+})
+
+describe('UsageFilters — account keyword and exact selection', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    mockAccountsList.mockReset().mockResolvedValue({ items: [] })
+  })
+  afterEach(() => vi.useRealTimers())
+
+  const accountInput = (wrapper: ReturnType<typeof mountFilters>) =>
+    wrapper.get('input[placeholder="Account, URL or model; Enter to search"]')
+
+  it('submits the keyword on Enter without selecting one of the suggestions', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 1, name: 'windhub-a' }, { id: 2, name: 'windhub-b' }] })
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue(' WindHub ')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    expect(mockAccountsList).toHaveBeenCalledWith(1, 20, { search: 'WindHub' })
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBe('WindHub')
+    expect(wrapper.props('modelValue').account_id).toBeUndefined()
+    expect((input.element as HTMLInputElement).value).toBe('WindHub')
+    expect(wrapper.emitted('change')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  it('preserves exact selection and switches to text filtering when the name is edited', async () => {
+    mockAccountsList.mockResolvedValue({ items: [{ id: 2351, name: 'windhub-a' }] })
+    const wrapper = mountFilters({ ...defaultFilters(), account_search: 'windhub' })
+    const input = accountInput(wrapper)
+    await input.setValue('windhub')
+    vi.advanceTimersByTime(300)
+    await flushPromises()
+    await wrapper.findAll('button').find(button => button.text().includes('windhub-a'))!.trigger('click')
+    expect(wrapper.props('modelValue').account_id).toBe(2351)
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_id).toBe(2351)
+
+    await input.setValue('glm')
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_id).toBeUndefined()
+    expect(wrapper.props('modelValue').account_search).toBe('glm')
+    expect((input.element as HTMLInputElement).value).toBe('glm')
+    await wrapper.get('button[aria-label="Clear account filter"]').trigger('click')
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    expect((input.element as HTMLInputElement).value).toBe('')
+    wrapper.unmount()
+  })
+
+  it('ignores stale suggestions after a newer search or an Enter submission', async () => {
+    const first = deferred<{ items: Array<{ id: number; name: string }> }>()
+    const second = deferred<{ items: Array<{ id: number; name: string }> }>()
+    mockAccountsList.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue('old')
+    vi.advanceTimersByTime(300)
+    await input.setValue('current')
+    vi.advanceTimersByTime(300)
+    second.resolve({ items: [{ id: 2, name: 'current-account' }] })
+    await flushPromises()
+    expect(wrapper.text()).toContain('current-account')
+    await input.trigger('keydown', { key: 'Enter' })
+    first.resolve({ items: [{ id: 1, name: 'old-account' }] })
+    await flushPromises()
+    await input.trigger('focus')
+    expect(wrapper.text()).not.toContain('old-account')
+    expect(wrapper.props('modelValue').account_search).toBe('current')
+    wrapper.unmount()
+  })
+
+  it('supports no-match keywords, clearing and parent reset while respecting IME composition', async () => {
+    const wrapper = mountFilters()
+    const input = accountInput(wrapper)
+    await input.setValue('不存在')
+    await input.trigger('keydown', { key: 'Enter', isComposing: true })
+    expect(wrapper.emitted('change')).toBeUndefined()
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBe('不存在')
+    await input.setValue('')
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    await input.setValue('draft')
+    await wrapper.setProps({ modelValue: defaultFilters() })
+    expect((input.element as HTMLInputElement).value).toBe('')
+    vi.advanceTimersByTime(300)
+    expect(mockAccountsList).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('keeps keyword submission disabled in cleanup filters', async () => {
+    const wrapper = mountFilters()
+    await wrapper.setProps({ allowAccountSearch: false })
+    const input = wrapper.get('input[placeholder="Search account..."]')
+    await input.setValue('windhub')
+    await input.trigger('keydown', { key: 'Enter' })
+    expect(wrapper.props('modelValue').account_search).toBeUndefined()
+    expect(wrapper.emitted('change')).toBeUndefined()
+    wrapper.unmount()
   })
 })
 

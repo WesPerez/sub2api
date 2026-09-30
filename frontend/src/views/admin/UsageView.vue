@@ -244,6 +244,7 @@ const breakdownFilters = computed(() => {
   if (filters.value.user_id) f.user_id = filters.value.user_id
   if (filters.value.api_key_id) f.api_key_id = filters.value.api_key_id
   if (filters.value.account_id) f.account_id = filters.value.account_id
+  if (filters.value.account_search) f.account_search = filters.value.account_search
   if (filters.value.group_id) f.group_id = filters.value.group_id
   if (filters.value.request_type != null) f.request_type = filters.value.request_type
   if (filters.value.native_compaction_v2 != null) f.native_compaction_v2 = filters.value.native_compaction_v2
@@ -449,6 +450,7 @@ const loadModelStats = async (source: ModelDistributionSource, force = false) =>
       model: filters.value.model,
       api_key_id: filters.value.api_key_id,
       account_id: filters.value.account_id,
+      account_search: filters.value.account_search,
       group_id: filters.value.group_id,
       request_type: requestType,
       stream: legacyStream === null ? undefined : legacyStream,
@@ -500,6 +502,7 @@ const loadChartData = async () => {
       model: filters.value.model,
       api_key_id: filters.value.api_key_id,
       account_id: filters.value.account_id,
+      account_search: filters.value.account_search,
       group_id: filters.value.group_id,
       request_type: requestType,
       stream: legacyStream === null ? undefined : legacyStream,
@@ -827,6 +830,7 @@ const loadAdminErrors = async () => {
       user_id: filters.value.user_id ?? undefined,
       api_key_id: filters.value.api_key_id ?? undefined,
       account_id: filters.value.account_id ?? undefined,
+      account_search: filters.value.account_search,
       group_id: filters.value.group_id ?? undefined,
       model: filters.value.model || undefined,
       phase: filters.value.error_phase || undefined,

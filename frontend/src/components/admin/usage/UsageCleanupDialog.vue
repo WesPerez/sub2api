@@ -7,6 +7,7 @@
         v-model:endDate="localEndDate"
         :exporting="false"
         :show-actions="false"
+        :allow-account-search="false"
         @change="noop"
       />
 
@@ -285,6 +286,10 @@ const openCancelConfirm = (task: UsageCleanupTask) => {
 }
 
 const buildPayload = (): CreateUsageCleanupTaskRequest | null => {
+  if (localFilters.value.account_search?.trim()) {
+    appStore.showError(t('admin.usage.cleanup.selectAccountForKeyword'))
+    return null
+  }
   if (!localStartDate.value || !localEndDate.value) {
     appStore.showError(t('admin.usage.cleanup.missingRange'))
     return null
