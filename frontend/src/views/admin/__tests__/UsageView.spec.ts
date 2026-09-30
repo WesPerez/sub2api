@@ -800,3 +800,48 @@ describe('admin UsageView model audit export', () => {
 		expect(saveAs).toHaveBeenCalledTimes(1)
 	})
 })
+
+
+describe('admin UsageView account keyword propagation', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    Object.keys(routeQuery).forEach(key => delete routeQuery[key])
+    list.mockReset().mockResolvedValue({ items: [], total: 0, pages: 0 })
+    exportList.mockReset().mockResolvedValue({ items: [], total: 0, pages: 0 })
+    getStats.mockReset().mockResolvedValue({ total_requests: 0 })
+    getSnapshotV2.mockReset().mockResolvedValue({ trend: [], groups: [] })
+    getModelStats.mockReset().mockResolvedValue({ models: [] })
+    listErrorLogs.mockReset().mockResolvedValue({ items: [], total: 0, pages: 0 })
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it('uses the same keyword for pages, totals, charts, ranking, export and errors, then resets it', async () => {
+    const wrapper = mountRouteFilteredUsageView()
+    await flushPromises()
+    const vm = wrapper.vm as any
+    vm.filters.account_search = 'windhub'
+    vm.pagination.page = 3
+    vm.applyFilters()
+    await flushPromises()
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub', page: 1 }), expect.anything())
+    expect(getStats).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub' }))
+    expect(getSnapshotV2).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub' }))
+    expect(getModelStats).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub' }))
+    expect(vm.breakdownFilters).toEqual(expect.objectContaining({ account_search: 'windhub' }))
+
+    vm.handlePageChange(2)
+    await flushPromises()
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub', page: 2 }), expect.anything())
+    await vm.exportToExcel()
+    expect(exportList).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub', exact_total: true }), expect.anything())
+    await vm.loadAdminErrors()
+    expect(listErrorLogs).toHaveBeenLastCalledWith(expect.objectContaining({ account_search: 'windhub' }))
+
+    vm.resetFilters()
+    await flushPromises()
+    expect(list.mock.calls.at(-1)?.[0].account_search).toBeUndefined()
+    expect(getStats.mock.calls.at(-1)?.[0].account_search).toBeUndefined()
+    expect(vm.breakdownFilters.account_search).toBeUndefined()
+    wrapper.unmount()
+  })
+})
