@@ -728,6 +728,16 @@ func normalizeOpenAIResponsesReasoningContentReplay(body []byte) ([]byte, bool, 
 	return normalized, true, nil
 }
 
+// Chat bridges need plaintext reasoning to populate assistant.reasoning_content.
+// The native Responses store=false filter must not erase it before conversion.
+// Keep compact/native behavior and the client's store setting unchanged.
+func normalizeOpenAIAccountStoreFalseReasoningReplay(body []byte, account *Account, knownStoreFalse bool) ([]byte, bool, error) {
+	if !knownStoreFalse && shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
+		return body, false, nil
+	}
+	return normalizeOpenAIAPIKeyStoreFalseReasoningReplay(body, knownStoreFalse)
+}
+
 func normalizeOpenAIAPIKeyStoreFalseReasoningReplay(body []byte, knownStoreFalse bool) ([]byte, bool, error) {
 	if !knownStoreFalse && gjson.GetBytes(body, "store").Type != gjson.False {
 		return body, false, nil
@@ -1442,12 +1452,15 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 			return body, false, err
 		}
 	}
-	if next, normalizedReasoningContent, err := normalizeOpenAIResponsesReasoningContentReplay(normalized); err != nil {
-		return body, false, err
-	} else if normalizedReasoningContent {
-		normalized = next
-		changed = true
+	if !shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
+		if next, normalizedReasoningContent, err := normalizeOpenAIResponsesReasoningContentReplay(normalized); err != nil {
+			return body, false, err
+		} else if normalizedReasoningContent {
+			normalized = next
+			changed = true
+		}
 	}
+
 	if account.IsOpenAIApiKey() {
 		if next, normalizedParallel, err := normalizeOpenAIParallelToolCallsWithoutTools(normalized, responsesLite); err != nil {
 			return body, false, err
@@ -1455,7 +1468,7 @@ func normalizeOpenAIResponsesWebSocketCompatibilityBody(body []byte, account *Ac
 			normalized = next
 			changed = true
 		}
-		if next, normalizedReasoning, err := normalizeOpenAIAPIKeyStoreFalseReasoningReplay(normalized, false); err != nil {
+		if next, normalizedReasoning, err := normalizeOpenAIAccountStoreFalseReasoningReplay(normalized, account, false); err != nil {
 			return body, false, err
 		} else if normalizedReasoning {
 			normalized = next

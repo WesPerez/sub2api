@@ -185,7 +185,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			body = normalized
 			originalBody = normalized
 		}
-		if normalized, changed, normalizeErr := normalizeOpenAIAPIKeyStoreFalseReasoningReplay(body, isOpenAIResponsesCompactPath(c)); normalizeErr != nil {
+		if normalized, changed, normalizeErr := normalizeOpenAIAccountStoreFalseReasoningReplay(body, account, isOpenAIResponsesCompactPath(c)); normalizeErr != nil {
 			return nil, normalizeErr
 		} else if changed {
 			body = normalized
