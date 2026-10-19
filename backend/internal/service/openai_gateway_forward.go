@@ -19,12 +19,15 @@ import (
 )
 
 // Forward forwards request to OpenAI API
-func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+func (s *OpenAIGatewayService) forwardResponsesAttempt(ctx context.Context, c *gin.Context, account *Account, body []byte) (*OpenAIForwardResult, error) {
+	lifecycleCtx := ctx
+	ctx, cancelPreparation := OpenAIResponsesPreOutputContext(ctx)
+	defer cancelPreparation()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	beginUpstreamResponseModelObservation(c)
 	ClearActualOpenAIUpstreamEndpoint(c)
-	if shouldForwardOpenAIResponsesViaRawChatCompletions(account) {
-		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
-	}
 	filteredBody, filterErr := filterOpenAIResponsesNoneReasoningEffortForAccount(account, body)
 	if filterErr != nil {
 		return nil, filterErr
@@ -34,14 +37,20 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	clearOpenAIResponsesClientToolMapping(c)
 	clearOpenAIResponsesNamespaceNames(c)
 	setCodexToolNameReverse(c, nil)
-	if _, err := s.prepareCodexAccountIdentitySource(ctx, c, account); err != nil {
+	identityCtx, cancelIdentity := OpenAIResponsesPreOutputContext(ctx)
+	_, identityErr := s.prepareCodexAccountIdentitySource(identityCtx, c, account)
+	cancelIdentity()
+	if err := identityErr; err != nil {
 		return nil, err
 	}
 	startTime := time.Now()
 	// 固定渠道映射后的请求级 canonical body；账号 normalize/strip 不得改写跨 failover hint。
 	canonicalImageIntentBody := body
 
-	restrictionResult := s.detectCodexClientRestriction(c, account, body)
+	restrictionResult := s.detectCodexClientRestrictionWithContext(ctx, c, account, body)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	apiKeyID := getAPIKeyIDFromContext(c)
 	// 执行作用域必须取自客户端原始身份：后面的账号 namespace 改写与指纹收敛会改掉
 	// 请求体里的 client_metadata / prompt_cache_key，用改写后的值取键会让不同会话
@@ -157,7 +166,24 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	originalModel := reqModel
 
 	if account.Platform == PlatformGrok {
-		return s.forwardGrokResponses(ctx, c, account, body, originalModel, reqStream, startTime)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return s.forwardGrokResponses(lifecycleCtx, c, account, body, originalModel, reqStream, startTime)
+	}
+
+	// Resolve once before protocol-specific replay cleanup. Model rules and the
+	// upstream catalog can select Chat even when the account-level probe cannot.
+	routingModel := upstreamRoutingModel(account, body, "")
+	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
+		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
+	}
+	upstreamProtocol := s.resolveUpstreamProtocolFor(ctx, account, APIProtocolResponses, routingModel)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if upstreamProtocol == APIProtocolChatCompletions {
+		SetActualOpenAIUpstreamEndpoint(c, "/v1/chat/completions")
 	}
 
 	if account.IsOpenAIApiKey() {
@@ -167,31 +193,35 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			body = normalized
 			originalBody = normalized
 		}
-		if normalized, changed, normalizeErr := normalizeOpenAIAPIKeyStoreFalseReasoningReplay(body, isOpenAIResponsesCompactPath(c)); normalizeErr != nil {
-			return nil, normalizeErr
-		} else if changed {
-			body = normalized
-			originalBody = normalized
+		// Chat conversion needs the plaintext reasoning for reasoning_content.
+		// Compact and native Responses retain their existing replay filter.
+		if upstreamProtocol != APIProtocolChatCompletions || compactPath {
+			if normalized, changed, normalizeErr := normalizeOpenAIAPIKeyStoreFalseReasoningReplay(body, compactPath); normalizeErr != nil {
+				return nil, normalizeErr
+			} else if changed {
+				body = normalized
+				originalBody = normalized
+			}
 		}
 		requestView = newOpenAIRequestView(body)
 		reqModel, reqStream, promptCacheKey = requestView.Model, requestView.Stream, requestView.PromptCacheKey
 		originalModel = reqModel
 	}
 
-	// 上游协议统一由 resolveUpstreamProtocol 判定（按模型分流时带上游模型目录）。OpenAI API Key 账号只会落到
-	// Responses / Chat Completions，上面的归一化对两条路径都生效。
-	routingModel := upstreamRoutingModel(account, body, "")
-	if account.IsOpenCodeGo() && IsOpenCodeUnsupportedModel(routingModel) {
-		return nil, writeOpenCodeUnsupportedModelError(c, false, routingModel)
-	}
-	switch s.resolveUpstreamProtocolFor(ctx, account, APIProtocolResponses, routingModel) {
+	switch upstreamProtocol {
 	case APIProtocolAnthropic:
 		// Responses 客户端 × Anthropic 上游：转成 Anthropic 请求走原生端点。不能落到
 		// raw-CC 分支——其 URL 构造会把 anthropic base 当 CC base 用。
 		// 账号映射未命中时以去除首尾空白的请求模型兜底，计费名与上游模型名一致。
-		return s.forwardResponsesViaNativeAnthropic(ctx, c, account, body, reqModel)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return s.forwardResponsesViaNativeAnthropic(lifecycleCtx, c, account, body, reqModel)
 	case APIProtocolChatCompletions:
-		return s.forwardResponsesViaRawChatCompletions(ctx, c, account, body, startTime)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return s.forwardResponsesViaRawChatCompletions(lifecycleCtx, c, account, body, startTime)
 	}
 	SetActualOpenAIUpstreamEndpoint(c, openAIResponsesUpstreamEndpoint)
 	if account.IsOpenAI() && (account.IsOpenAIApiKey() || account.IsOpenAIOAuthLike()) {
@@ -275,7 +305,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// 国产模型默认 effort 补充：也要用 mappedModel 判定是否是 passback-required 上游。
 		reasoningEffort = ApplyThinkingEnabledFallback(reasoningEffort, body, mappedModel)
 		return s.forwardOpenAIPassthrough(
-			ctx,
+			lifecycleCtx,
 			c,
 			account,
 			originalBody,
@@ -681,6 +711,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	} else if s.shouldForceOpenAIFastPriorityForMissingTier(ctx, account, upstreamModel) {
 		markPatchSet("service_tier", OpenAIFastTierPriority)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	if account.UsesOpenAICodexProtocol() {
 		decoded, decodeErr := ensureReqBody()
@@ -776,12 +809,23 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		imageSizeTier = imageCfg.SizeTier
 		imageInputSize = imageCfg.InputSize
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Get access token
-	token, _, err := s.GetAccessToken(ctx, account)
+	tokenCtx, cancelToken := OpenAIResponsesPreOutputContext(ctx)
+	token, _, err := s.GetAccessToken(tokenCtx, account)
+	cancelToken()
 	if err != nil {
 		return nil, err
 	}
 	SetOpsUpstreamModel(c, upstreamModel)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Transport guards inherit the absolute budget value, while healthy streams
+	// retain the client's lifecycle instead of a preparation-only deadline.
+	ctx = lifecycleCtx
 
 	// 命中 WS 时仅走 WebSocket Mode；不再自动回退 HTTP。
 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
@@ -1027,7 +1071,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	}
 	firstOutputTimeout := time.Duration(0)
 	if reqStream && account.Platform == PlatformOpenAI {
-		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffortValue)
+		firstOutputTimeout = s.openAIFirstOutputAttemptTimeout(ctx, startTime, reasoningEffortValue)
 	}
 
 	httpInvalidEncryptedContentRetryTried := false
@@ -1035,12 +1079,22 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	for {
+		// Preserve in-flight usage draining, but do not start another HTTP
+		// compatibility attempt after the original client has disconnected.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if firstOutputTimeout > 0 && !time.Now().Before(startTime.Add(firstOutputTimeout)) {
+			return nil, s.newOpenAIFirstOutputTimeoutError(ctx, c, account,
+				opsUpstreamProxyID(account), opsUpstreamProxyName(account), startTime,
+				originalModel, reasoningEffortValue, firstOutputTimeout, "before_attempt", nil)
+		}
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var headerGuard *openAIFirstOutputHeaderGuard
 		if firstOutputTimeout > 0 {
 			upstreamCtx, headerGuard = newOpenAIFirstOutputHeaderGuard(
-				upstreamCtx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
+				ctx, releaseUpstreamCtx, startTime.Add(firstOutputTimeout),
 			)
 		}
 		upstreamReq, err := s.buildUpstreamRequest(upstreamCtx, c, account, body, token, reqStream, promptCacheKey, isCodexCLI)
@@ -1064,7 +1118,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		upstreamStart := time.Now()
 		resp, err := s.doOpenAIUpstream(upstreamReq, proxyURL, account)
 		SetOpsLatencyMs(c, OpsUpstreamLatencyMsKey, time.Since(upstreamStart).Milliseconds())
-		if headerGuard != nil && headerGuard.stopHeaderWait() {
+		// Error bodies can stall after headers too. Keep the same deadline until
+		// the error body is consumed; successful streams take over the timer.
+		if headerGuard != nil && (err != nil || resp.StatusCode < 400) && headerGuard.stopHeaderWait() {
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
@@ -1082,6 +1138,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			if headerGuard != nil {
 				headerGuard.close()
 			}
+			if headerGuard != nil && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			// Transport-level failure (proxy/DNS/TCP/TLS — no HTTP response). Convert to
 			// a failover so the handler switches to a healthy account, and temporarily
 			// unschedule the account on durable faults (e.g. rejected proxy credentials).
@@ -1096,7 +1155,20 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		// Handle error response
 		if resp.StatusCode >= 400 {
 			respBody := s.readUpstreamErrorBody(resp)
+			if budgetErr := responsesAttemptError(ctx); budgetErr != nil {
+				_ = resp.Body.Close()
+				return nil, budgetErr
+			}
+			if headerGuard != nil && headerGuard.stopHeaderWait() {
+				_ = resp.Body.Close()
+				return nil, s.newOpenAIFirstOutputTimeoutError(ctx, c, account,
+					opsUpstreamProxyID(account), opsUpstreamProxyName(account), startTime,
+					originalModel, reasoningEffortValue, firstOutputTimeout, "error_body", resp.Header)
+			}
 			_ = resp.Body.Close()
+			if headerGuard != nil && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(respBody))
 
 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
@@ -1219,6 +1291,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 
 		// Handle normal response
 		var usage *OpenAIUsage
+		var forwardErr error
 		var firstTokenMs *int
 		responseID := ""
 		imageCount := 0
@@ -1263,7 +1336,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					}
 					return s.handleErrorResponse(ctx, compactResp, c, account, body, resolveOpenAIErrorSchedulingModel(billingModel, upstreamModel))
 				}
-				return nil, err
+				var failover *UpstreamFailoverError
+				if streamResult == nil || errors.As(err, &failover) {
+					return nil, err
+				}
+				forwardErr = err
 			}
 			usage = streamResult.usage
 			firstTokenMs = streamResult.firstTokenMs
@@ -1343,7 +1420,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			forwardResult.SearchCount = searchCount
 		}
 		stampOpenAIResponsesUpstreamEndpoint(c, forwardResult)
-		return forwardResult, nil
+		return forwardResult, forwardErr
 	}
 }
 

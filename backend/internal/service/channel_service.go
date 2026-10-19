@@ -193,7 +193,7 @@ func (s *ChannelService) loadCache(ctx context.Context) (*channelCache, error) {
 		}
 	}
 
-	result, err, _ := s.cacheSF.Do("channel_cache", func() (any, error) {
+	result, err, _ := doContextSingleflight(ctx, &s.cacheSF, "channel_cache", func() (any, error) {
 		// 双重检查
 		if cached, ok := s.cache.Load().(*channelCache); ok && cached != nil {
 			if time.Since(cached.loadedAt) < channelCacheTTL {

@@ -41,6 +41,12 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 	body []byte,
 	defaultMappedModel string,
 ) (*OpenAIForwardResult, error) {
+	lifecycleCtx := ctx
+	ctx, cancelPreparation := OpenAIResponsesPreOutputContext(ctx)
+	defer cancelPreparation()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	startTime := time.Now()
 
 	// 1. Lower Codex client-side tools to function tools understood by Anthropic.
@@ -115,6 +121,10 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 		proxyURL = account.Proxy.URL()
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx = lifecycleCtx
 	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
 	upstreamReq, forwardedBody, err := s.buildNativeAnthropicUpstreamRequest(upstreamCtx, c, account, anthropicBody, apiKey, targetURL, body)
 	releaseUpstreamCtx()
@@ -133,6 +143,9 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if budgetErr := responsesAttemptError(ctx); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
 			return nil, foErr
 		}
@@ -169,6 +182,7 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 
 	var finalResp *apicompat.AnthropicResponse
 	var usage ClaudeUsage
+	var streamReadErr error
 
 	// 读间隔上限：上游挂住 SSE 时中止组装（缓冲路径尚未提交响应头，可回 502）。
 	streamInterval := anthropicNativeStreamInterval(s.cfg)
@@ -195,11 +209,17 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 
 	for {
 		line, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
 			}
 			logReadErr(rerr)
+			if !errors.Is(rerr, io.EOF) {
+				streamReadErr = rerr
+			}
 			break
 		}
 		// SSE 规范允许 `event:xxx`（冒号后无空格）：Kimi 等上游返回紧凑格式。
@@ -208,11 +228,17 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 		}
 
 		dataLine, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
 			}
 			logReadErr(rerr)
+			if !errors.Is(rerr, io.EOF) {
+				streamReadErr = rerr
+			}
 			break
 		}
 		payload, ok := extractOpenAISSEDataLine(dataLine)
@@ -255,8 +281,14 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 				}
 			}
 		}
+		if event.Type == "message_stop" {
+			break
+		}
 	}
 
+	if streamReadErr != nil {
+		return nil, fmt.Errorf("stream usage incomplete: %w", streamReadErr)
+	}
 	if finalResp == nil {
 		writeResponsesError(c, http.StatusBadGateway, "server_error", "Upstream stream ended without a response")
 		return nil, fmt.Errorf("upstream stream ended without response")
@@ -439,13 +471,20 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 		}
 	}
 
+	var streamReadErr error
 	for {
 		line, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return resultWithUsage(), budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
 			}
 			logReadErr(rerr)
+			if !errors.Is(rerr, io.EOF) {
+				streamReadErr = rerr
+			}
 			break
 		}
 		if _, ok := extractOpenAISSEEventLine(line); !ok {
@@ -453,11 +492,17 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 		}
 
 		dataLine, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
 			}
 			logReadErr(rerr)
+			if !errors.Is(rerr, io.EOF) {
+				streamReadErr = rerr
+			}
 			break
 		}
 		payload, ok := extractOpenAISSEDataLine(dataLine)
@@ -471,8 +516,17 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 		}
 
 		processAnthropicEvent(&event)
+		if state.CompletedSent {
+			// message_stop already contains the final protocol decision and
+			// usage. Waiting for EOF can turn a completed response into an idle
+			// failure if the provider keeps the transport open.
+			break
+		}
 	}
 
+	if streamReadErr != nil {
+		return resultWithUsage(), fmt.Errorf("stream usage incomplete: %w", streamReadErr)
+	}
 	// Finalize state machine（客户端已断开时仍推进，保证 usage 汇总完整；仅在
 	// 客户端仍连接时写出）。终态帧与逐事件路径一致过工具名反转与客户端工具还原，
 	// 避免流截断时终态帧携带改写后的工具名。

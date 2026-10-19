@@ -55,6 +55,10 @@ jobs:
         run: |
           go test -race ./internal/pkg/resinrecovery
           go test -race -run '^TestResinRecovery' ./internal/repository ./internal/service
+      - name: First-output and stream lifecycle race tests
+        working-directory: backend
+        run: |
+          go test -race -run '^Test(HTTPUpstream|OpenAIFirstOutput|OpenAIResponseFlush_IdleDeadline)' ./internal/repository ./internal/service
 
   test-integration:
     runs-on: ubuntu-latest

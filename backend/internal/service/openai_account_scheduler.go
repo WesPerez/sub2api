@@ -1181,6 +1181,9 @@ func (s *defaultOpenAIAccountScheduler) tryAcquireOpenAISelectionOrderWithBudget
 		}
 	}
 	for i := 0; i < len(selectionOrder); i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, compactBlocked, err
+		}
 		candidate := selectionOrder[i]
 		if candidate.account == nil {
 			continue
@@ -1697,6 +1700,9 @@ func (s *defaultOpenAIAccountScheduler) finishLoadBalanceSelectionFallback(
 		wantAttempted := pass == 1 || pass == 3
 		wantKnownFull := pass >= 2
 		for _, candidate := range attempt.selectionOrder {
+			if err := ctx.Err(); err != nil {
+				return nil, candidateCount, topK, loadSkew, err
+			}
 			if candidate.account == nil {
 				continue
 			}
@@ -1898,7 +1904,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 		}
 	}
 
-	result, _, _ := openAIAdvancedSchedulerSettingSF.Do(openAIAdvancedSchedulerSettingKey, func() (any, error) {
+	result, _, _ := doContextSingleflight(ctx, &openAIAdvancedSchedulerSettingSF, openAIAdvancedSchedulerSettingKey, func() (any, error) {
 		if cached, ok := openAIAdvancedSchedulerSettingCache.Load().(*cachedOpenAIAdvancedSchedulerSetting); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return openAIAdvancedSchedulerRuntimeSettings{
@@ -2175,9 +2181,14 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	previousResponseCanMove bool,
 	useUpstreamTokenCost bool,
 ) (*AccountSelectionResult, OpenAIAccountScheduleDecision, error) {
+	originalExcludedCount := len(excludedIDs)
+	if NormalizeOpenAICompatiblePlatform(platform) == PlatformOpenAI {
+		excludedIDs = s.withOpenAISessionTimeoutExclusions(ctx, groupID, sessionHash, requestedModel, excludedIDs)
+	}
+	hadSessionExclusions := len(excludedIDs) > originalExcludedCount
 	selection, decision, err := s.selectAccountWithSchedulerOnce(ctx, groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
 	if err == nil || openAIProxyStreamQuarantineBypassed(ctx) {
-		return selection, decision, err
+		return selection, decision, openAISessionTimeoutSelectionError(err, hadSessionExclusions)
 	}
 	if !errors.Is(err, ErrNoAvailableAccounts) && !errors.Is(err, ErrNoAvailableCompactAccounts) {
 		return selection, decision, err
@@ -2188,10 +2199,11 @@ func (s *OpenAIGatewayService) selectAccountWithScheduler(
 	}
 	blocked := s.getOpenAIProxyStreamCircuit().activeBlockCount(time.Now())
 	if blocked == 0 {
-		return selection, decision, err
+		return selection, decision, openAISessionTimeoutSelectionError(err, hadSessionExclusions)
 	}
 	s.logOpenAIProxyStreamQuarantineFailOpen(requestedModel, blocked)
-	return s.selectAccountWithSchedulerOnce(withOpenAIProxyStreamQuarantineBypass(ctx), groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+	selection, decision, err = s.selectAccountWithSchedulerOnce(withOpenAIProxyStreamQuarantineBypass(ctx), groupID, previousResponseID, sessionHash, requestedModel, excludedIDs, requiredTransport, requiredCapability, requiredImageCapability, requireCompact, platform, previousResponseCanMove, useUpstreamTokenCost)
+	return selection, decision, openAISessionTimeoutSelectionError(err, hadSessionExclusions)
 }
 
 type openAIGroupPrivacyRequirementContextKey struct{}
@@ -2513,6 +2525,12 @@ func (s *OpenAIGatewayService) isOpenAIAccountTransportCompatible(account *Accou
 }
 
 func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Account, model string, success bool, firstTokenMs *int, observedErr ...error) bool {
+	return s.ReportOpenAIAccountScheduleResultContext(context.Background(), account, model, success, firstTokenMs, observedErr...)
+}
+
+func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResultContext(ctx context.Context, account *Account, model string, success bool, firstTokenMs *int, observedErr ...error) bool {
+	ctx, cancel := openAIResponsesMaintenanceContext(ctx, 3*time.Second)
+	defer cancel()
 	if account == nil {
 		return false
 	}
@@ -2520,16 +2538,16 @@ func (s *OpenAIGatewayService) ReportOpenAIAccountScheduleResult(account *Accoun
 	healthTripped := false
 	if s != nil && s.rateLimitService != nil {
 		if success {
-			s.rateLimitService.ObserveOpenAIAPIKeyHealthSuccess(context.Background(), account)
+			s.rateLimitService.ObserveOpenAIAPIKeyHealthSuccess(ctx, account)
 		} else if len(observedErr) > 0 && observedErr[0] != nil {
-			healthTripped = s.rateLimitService.ObserveOpenAIAPIKeyHealthFailure(context.Background(), account, observedErr[0])
+			healthTripped = s.rateLimitService.ObserveOpenAIAPIKeyHealthFailure(ctx, account, observedErr[0])
 		}
 	}
 	if success {
 		s.openaiOAuth429RetryStartedAt.Delete(accountID)
 		s.clearOpenAIAccountModelTransientState(accountID, normalizeOpenAIAccountModelTransientModel(model))
 	}
-	scheduler := s.getOpenAIAccountScheduler(context.Background())
+	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		return healthTripped
 	}
@@ -2547,7 +2565,13 @@ func (s *OpenAIGatewayService) ObserveOpenAIAccountHealthFailure(ctx context.Con
 }
 
 func (s *OpenAIGatewayService) RecordOpenAIAccountSwitch() {
-	scheduler := s.getOpenAIAccountScheduler(context.Background())
+	s.RecordOpenAIAccountSwitchContext(context.Background())
+}
+
+func (s *OpenAIGatewayService) RecordOpenAIAccountSwitchContext(ctx context.Context) {
+	ctx, cancel := OpenAIResponsesPreOutputContext(ctx)
+	defer cancel()
+	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		return
 	}

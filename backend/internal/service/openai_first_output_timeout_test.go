@@ -26,6 +26,78 @@ type blockingOpenAIResponseHeaderUpstream struct {
 	once     sync.Once
 }
 
+type firstOutputSlowPolicyRepo struct {
+	SettingRepository
+	calls                  int
+	enteredWithLiveContext bool
+	entered                chan struct{}
+}
+
+func (r *firstOutputSlowPolicyRepo) GetValue(ctx context.Context, key string) (string, error) {
+	if key != SettingKeyOpenAIFastPolicySettings {
+		return "", ErrSettingNotFound
+	}
+	r.calls++
+	r.enteredWithLiveContext = ctx.Err() == nil
+	close(r.entered)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func TestOpenAIFirstOutputBudgetCancelsPolicyBeforeDispatch(t *testing.T) {
+	repo := &firstOutputSlowPolicyRepo{entered: make(chan struct{})}
+	cfg := &config.Config{Gateway: config.GatewayConfig{OpenAIFirstOutputTimeoutSeconds: 60}}
+	upstream := &firstOutputUnexpectedDispatch{}
+	svc := &OpenAIGatewayService{cfg: cfg, settingService: NewSettingService(repo, cfg), httpUpstream: upstream}
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	body := []byte(`{"model":"gpt-5.5","stream":true,"input":"hello"}`)
+	c.Request = httptest.NewRequest("POST", "/responses", bytes.NewReader(body))
+	account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Credentials: map[string]any{"access_token": "test"}}
+	ctx := WithOpenAIResponsesFirstOutputBudget(context.Background(), 500*time.Millisecond)
+	started := time.Now()
+	finished := make(chan error, 1)
+	go func() {
+		_, err := svc.Forward(ctx, c, account, body)
+		finished <- err
+	}()
+	select {
+	case <-repo.entered:
+		require.True(t, repo.enteredWithLiveContext, "must enter policy before the deadline")
+	case <-time.After(2 * time.Second):
+		t.Fatal("policy was not entered")
+	}
+	var err error
+	select {
+	case err = <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("policy was not canceled")
+	}
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Equal(t, 1, repo.calls)
+	require.True(t, repo.enteredWithLiveContext, "must exercise in-flight policy cancellation")
+	require.Less(t, time.Since(started), 1500*time.Millisecond)
+	require.Zero(t, upstream.calls.Load(), "canceled preparation must never dispatch")
+	require.NoError(t, ctx.Err(), "healthy stream lifecycle must stay independent")
+}
+
+type firstOutputUnexpectedDispatch struct{ calls atomic.Int32 }
+
+func (u *firstOutputUnexpectedDispatch) Do(*http.Request, string, int64, int) (*http.Response, error) {
+	u.calls.Add(1)
+	return nil, errors.New("unexpected upstream dispatch")
+}
+
+func (u *firstOutputUnexpectedDispatch) DoWithTLS(req *http.Request, proxy string, accountID int64, concurrency int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	return u.Do(req, proxy, accountID, concurrency)
+}
+
+func TestOpenAIFirstOutputExpiredBudgetSkipsPreparation(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	ctx := WithOpenAIResponsesFirstOutputDeadline(context.Background(), time.Now().Add(-time.Second))
+	_, err := svc.Forward(ctx, nil, nil, nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
 type firstOutputCloseTrackingBody struct {
 	io.ReadCloser
 	closed chan struct{}
@@ -78,6 +150,7 @@ func TestOpenAIForwardFirstOutputTimeoutIncludesResponseHeaderWait(t *testing.T)
 	var failoverErr *UpstreamFailoverError
 	require.ErrorAs(t, err, &failoverErr)
 	require.Equal(t, http.StatusGatewayTimeout, failoverErr.StatusCode)
+	require.True(t, failoverErr.FirstOutputTimedOut)
 	require.Contains(t, string(failoverErr.ResponseBody), "first_output_timeout")
 	require.True(t, failoverErr.SafeToFailoverAfterWrite)
 	require.Less(t, time.Since(started), 1300*time.Millisecond)
@@ -349,7 +422,7 @@ func TestOpenAINativeFirstOutputTimeoutDisarmsAfterSemanticOutput(t *testing.T) 
 		"X-Ratelimit-Remaining-Requests": []string{"42"},
 	}, Body: pr}
 
-	result, err := svc.handleStreamingResponse(c.Request.Context(), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+	result, err := svc.handleStreamingResponse(WithOpenAIResponsesFirstOutputBudget(c.Request.Context(), 500*time.Millisecond), resp, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
 
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -674,5 +747,194 @@ func TestOpenAINativeFirstOutputFailoverKeepsAttemptHeadersPrivateAfterKeepalive
 	case <-firstWriterDone:
 	case <-time.After(time.Second):
 		t.Fatal("first account writer did not exit after timeout")
+	}
+}
+
+// A slow HTTP error body must not bypass the first-output deadline after headers.
+type firstOutputErrorBodyUpstream struct {
+	HTTPUpstream
+	status   int
+	canceled chan struct{}
+}
+
+func (u *firstOutputErrorBodyUpstream) Do(req *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	pr, pw := io.Pipe()
+	go func() {
+		<-req.Context().Done()
+		_ = pw.CloseWithError(req.Context().Err())
+		close(u.canceled)
+	}()
+	return &http.Response{StatusCode: u.status, Header: http.Header{}, Body: pr}, nil
+}
+
+func TestOpenAIFirstOutputBudgetBoundsSlowErrorBody(t *testing.T) {
+	for _, status := range []int{429, 502} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			upstream := &firstOutputErrorBodyUpstream{status: status, canceled: make(chan struct{})}
+			svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+				OpenAIFirstOutputTimeoutSeconds: 60,
+			}}, httpUpstream: upstream}
+			body := []byte(`{"model":"gpt-5.1","stream":true,"input":"hello"}`)
+			c, rec := newFirstOutputBudgetTestContext(body)
+			ctx := WithOpenAIResponsesFirstOutputBudget(c.Request.Context(), 100*time.Millisecond)
+			account := &Account{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
+				Credentials: map[string]any{"api_key": "synthetic", "base_url": "https://example.com"}}
+			started := time.Now()
+			_, err := svc.Forward(ctx, c, account, body)
+			var failover *UpstreamFailoverError
+			require.ErrorAs(t, err, &failover)
+			require.True(t, failover.FirstOutputTimedOut)
+			require.Less(t, time.Since(started), time.Second)
+			require.Empty(t, rec.Body.String())
+			select {
+			case <-upstream.canceled:
+			case <-time.After(time.Second):
+				t.Fatal("old attempt remains active")
+			}
+		})
+	}
+}
+
+func TestOpenAIFirstOutputBudgetDoesNotResetOrCancelHealthyStream(t *testing.T) {
+	ctx := WithOpenAIResponsesFirstOutputBudget(context.Background(), 40*time.Millisecond)
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{OpenAIFirstOutputTimeoutSeconds: 60}}}
+	first := svc.openAIFirstOutputAttemptTimeout(ctx, time.Now(), "xhigh")
+	time.Sleep(20 * time.Millisecond)
+	second := svc.openAIFirstOutputAttemptTimeout(ctx, time.Now(), "xhigh")
+	require.Less(t, second, first)
+	time.Sleep(30 * time.Millisecond)
+	remaining, enabled := OpenAIResponsesFirstOutputBudgetRemaining(ctx)
+	require.True(t, enabled)
+	require.LessOrEqual(t, remaining, time.Duration(0))
+	require.NoError(t, ctx.Err(), "budget must not cancel an established stream")
+}
+
+func TestOpenAINativeCancelBeforeOutputClosesReader(t *testing.T) {
+	svc := &OpenAIGatewayService{cfg: &config.Config{Gateway: config.GatewayConfig{
+		OpenAIFirstOutputTimeoutSeconds: 60, MaxLineSize: defaultMaxLineSize,
+	}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	body := &firstOutputCloseTrackingBody{ReadCloser: pr, closed: make(chan struct{})}
+	c, rec := newFirstOutputBudgetTestContext(nil)
+	time.AfterFunc(20*time.Millisecond, cancel)
+	_, err := svc.handleStreamingResponse(ctx, &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, c,
+		&Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, rec.Body.String())
+	select {
+	case <-body.closed:
+	default:
+		t.Fatal("canceled stream reader still open")
+	}
+}
+
+func newFirstOutputBudgetTestContext(body []byte) (*gin.Context, *httptest.ResponseRecorder) {
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	return c, rec
+}
+
+func TestOpenAIFirstOutputBudgetWorksWithoutPerAttemptTimeout(t *testing.T) {
+	svc := &OpenAIGatewayService{}
+	ctx := WithOpenAIResponsesFirstOutputBudget(context.Background(), time.Second)
+	timeout := svc.openAIFirstOutputAttemptTimeout(ctx, time.Now(), "")
+	require.Greater(t, timeout, time.Duration(0))
+	require.LessOrEqual(t, timeout, time.Second)
+}
+
+func TestOpenAIFirstOutputAbsoluteBudgetDoesNotRestartAtAdmission(t *testing.T) {
+	deadline := time.Now().Add(-time.Millisecond)
+	ctx := WithOpenAIResponsesFirstOutputDeadline(context.Background(), deadline)
+	remaining, enabled := OpenAIResponsesFirstOutputBudgetRemaining(ctx)
+	require.True(t, enabled)
+	require.Negative(t, remaining)
+	phase, cancel := OpenAIResponsesPreOutputContext(ctx)
+	defer cancel()
+	require.ErrorIs(t, phase.Err(), context.DeadlineExceeded)
+	require.NoError(t, ctx.Err(), "admission deadline must not cancel a healthy stream/slot lifecycle")
+}
+
+type firstOutputUncooperativeRead struct {
+	started   chan struct{}
+	release   chan struct{}
+	closed    chan struct{}
+	returned  chan struct{}
+	readOnce  sync.Once
+	closeOnce sync.Once
+}
+
+func (b *firstOutputUncooperativeRead) Read([]byte) (int, error) {
+	b.readOnce.Do(func() { close(b.started) })
+	<-b.release
+	close(b.returned)
+	return 0, io.EOF
+}
+func (b *firstOutputUncooperativeRead) Close() error {
+	b.closeOnce.Do(func() { close(b.closed) })
+	return nil
+}
+
+func TestOpenAIFirstOutputTeardownDoesNotAwaitUncooperativeScanner(t *testing.T) {
+	for _, clientCancel := range []bool{false, true} {
+		t.Run(map[bool]string{false: "timeout", true: "client_cancel"}[clientCancel], func(t *testing.T) {
+			body := &firstOutputUncooperativeRead{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{}), returned: make(chan struct{})}
+			defer func() {
+				close(body.release)
+				select {
+				case <-body.returned:
+				case <-time.After(time.Second):
+					t.Error("reader did not finish after release")
+				}
+			}()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			ctx = WithOpenAIResponsesFirstOutputBudget(ctx, 100*time.Millisecond)
+			c, rec := newFirstOutputBudgetTestContext(nil)
+			svc := &OpenAIGatewayService{}
+			done := make(chan error, 1)
+			go func() {
+				_, err := svc.handleStreamingResponse(ctx, &http.Response{StatusCode: 200, Header: http.Header{}, Body: body}, c, &Account{ID: 1, Platform: PlatformOpenAI}, time.Now(), "model", "model")
+				done <- err
+			}()
+			<-body.started
+			if clientCancel {
+				cancel()
+			}
+			select {
+			case err := <-done:
+				if clientCancel {
+					require.ErrorIs(t, err, context.Canceled)
+				} else {
+					var failure *UpstreamFailoverError
+					require.ErrorAs(t, err, &failure)
+					require.True(t, failure.FirstOutputTimedOut)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("handler waited for scanner after canceling attempt")
+			}
+			select {
+			case <-body.closed:
+			default:
+				t.Fatal("upstream body not closed")
+			}
+			require.Empty(t, rec.Body.String())
+		})
+	}
+}
+
+func TestOpenAIFirstOutputHeaderGuardConcurrentStopAndClose(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		_, guard := newOpenAIFirstOutputHeaderGuard(context.Background(), func() {}, time.Now().Add(time.Hour))
+		done := make(chan struct{})
+		go func() { guard.close(); close(done) }()
+		require.False(t, guard.stopHeaderWait())
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("guard stop/close deadlocked")
+		}
 	}
 }

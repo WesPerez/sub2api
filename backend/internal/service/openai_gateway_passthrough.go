@@ -136,6 +136,12 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	reqStream bool,
 	startTime time.Time,
 ) (*OpenAIForwardResult, error) {
+	lifecycleCtx := ctx
+	ctx, cancelPreparation := OpenAIResponsesPreOutputContext(ctx)
+	defer cancelPreparation()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	requestedModel := reqModel
 	upstreamPassthroughModel := ""
 	if isOpenAIResponsesCompactPath(c) {
@@ -360,17 +366,27 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	if c != nil {
 		c.Set("openai_passthrough", true)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx = lifecycleCtx
 
 	agentTaskRecoveryTried := false
 	compactModelFallbackRetried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	var resp *http.Response
 	var usage *OpenAIUsage
+	var forwardErr error
 	var firstTokenMs *int
 	responseID := ""
 	imageCount := 0
 	var imageOutputSizes []string
 	for {
+		// An in-flight response may outlive the client to drain terminal usage,
+		// but a disconnected client must not start another compatibility attempt.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		actualModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 		if actualModel == "" {
 			actualModel = reqModel
@@ -396,6 +412,9 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 			// passthrough error handling sees the same response after recovery fails.
 			probeBody := s.readUpstreamErrorBody(resp)
 			_ = resp.Body.Close()
+			if budgetErr := responsesAttemptError(ctx); budgetErr != nil {
+				return nil, budgetErr
+			}
 			resp.Body = io.NopCloser(bytes.NewReader(probeBody))
 			if retryBody, reason, changed, retryErr := normalizeOpenAIResponsesRejectedFieldRetryBody(resp.StatusCode, body, probeBody); retryErr != nil {
 				return nil, fmt.Errorf("normalize passthrough rejected Responses field retry body: %w", retryErr)
@@ -473,8 +492,12 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 					}
 					return nil, s.handleErrorResponsePassthrough(ctx, compactResp, c, account, body, compactBody)
 				}
-				_ = resp.Body.Close()
-				return nil, handleErr
+				var failover *UpstreamFailoverError
+				if result == nil || errors.As(handleErr, &failover) {
+					_ = resp.Body.Close()
+					return nil, handleErr
+				}
+				forwardErr = handleErr
 			}
 			usage = result.usage
 			firstTokenMs = result.firstTokenMs
@@ -551,7 +574,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		forwardResult.ImageOutputSizes = imageOutputSizes
 		forwardResult.BillingModel = imageBillingModel
 	}
-	return forwardResult, nil
+	return forwardResult, forwardErr
 }
 
 func logOpenAIPassthroughInstructionsRejected(
@@ -1321,15 +1344,20 @@ func openAIStreamFailedEventErrorCode(payload []byte) string {
 	if code == "" {
 		code = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "error.code").String()))
 	}
+	if code == "" && gjson.GetBytes(payload, "type").String() == "error" {
+		// Responses error events use top-level code/message fields. The message
+		// need not contain the machine code (for example, "token rate limit").
+		code = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "code").String()))
+	}
 	return code
 }
 
 // isOpenAIUpstreamCapacityShedEvent 判断流内 failed 事件是否为上游容量降载信号。
 // 上游在容量紧张时会把请求丢进降载路径：HTTP 200 之后立刻推 event: error
-// （code=server_is_overloaded / slow_down）并以 response.failed 收尾。
+// （code=server_is_overloaded / slow_down / no_capacity）；部分上游仅发 bare error。
 func isOpenAIUpstreamCapacityShedEvent(payload []byte) bool {
 	switch openAIStreamFailedEventErrorCode(payload) {
-	case "server_is_overloaded", "slow_down":
+	case "server_is_overloaded", "slow_down", "no_capacity":
 		return true
 	}
 	for _, path := range []string{"response.error.message", "error.message", "message"} {
@@ -1380,10 +1408,17 @@ func sanitizeOpenAICapacityShedErrorCodeForClient(payload []byte) ([]byte, bool)
 	}
 	updated := payload
 	changed := false
-	for _, path := range []string{"response.error.code", "error.code"} {
-		parent := strings.TrimSuffix(path, ".code")
-		if !gjson.GetBytes(updated, parent).Exists() {
-			continue
+	for _, path := range []string{"response.error.code", "error.code", "code"} {
+		if path == "code" {
+			if gjson.GetBytes(updated, "type").String() != "error" ||
+				!gjson.GetBytes(updated, path).Exists() {
+				continue
+			}
+		} else {
+			parent := strings.TrimSuffix(path, ".code")
+			if !gjson.GetBytes(updated, parent).Exists() {
+				continue
+			}
 		}
 		code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(updated, path).String()))
 		if code != "" && code != "server_is_overloaded" && code != "slow_down" {
@@ -1631,6 +1666,19 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	if isOpenAIUpstreamAccessStateError(message, payload) {
 		return true
 	}
+	// Azure-compatible upstreams can reject peak-load request sizes with a bare
+	// no_capacity event after response.created. It has no HTTP error status or
+	// retry wording, but is still a capacity failure before semantic output.
+	if isOpenAIUpstreamCapacityShedEvent(payload) {
+		return true
+	}
+	// Some Responses gateways report a temporary service outage as a bare
+	// bad_response event. The bilingual message does not contain our English
+	// retry markers. Treat only this explicit outage as recoverable; unrelated
+	// bad_response errors can still describe a malformed request or response.
+	if isOpenAIStreamUnavailableServiceError(payload) {
+		return true
+	}
 	switch openAIStreamFailedEventSemanticStatus(payload, message) {
 	case http.StatusForbidden:
 		return openAIStream403AccountFailure(payload, message)
@@ -1646,6 +1694,21 @@ func openAIStreamErrorEventShouldFailover(payload []byte, message string) bool {
 	return strings.Contains(combined, "temporary") ||
 		strings.Contains(combined, "try again") ||
 		strings.Contains(combined, "please retry")
+}
+
+func isOpenAIStreamUnavailableServiceError(payload []byte) bool {
+	if gjson.GetBytes(payload, "type").String() != "error" ||
+		openAIStreamFailedEventErrorCode(payload) != "bad_response" {
+		return false
+	}
+	message := strings.ToLower(strings.TrimSpace(extractOpenAISSEErrorMessage(payload)))
+	// Explicit auth, permission, quota and invalid-request signals keep their
+	// existing precedence even if a contradictory outer message says outage.
+	if openAIStreamFailedEventSemanticStatus(payload, message) != http.StatusBadGateway {
+		return false
+	}
+	return message == "unavailable service" ||
+		message == "上游服务暂时不可用，unavailable service"
 }
 
 func (s *OpenAIGatewayService) handleOpenAIStreamTerminalAccountSideEffects(
@@ -2020,10 +2083,17 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	if s.cfg != nil && s.cfg.Gateway.MaxLineSize > 0 {
 		maxLineSize = s.cfg.Gateway.MaxLineSize
 	}
-	scanBuf := getSSEScannerBuf64K()
-	scanner.Buffer(scanBuf[:0], maxLineSize)
-	defer putSSEScannerBuf64K(scanBuf)
+	// The pump owns this buffer until its reader exits. A transport that fails
+	// to unblock must not hold the response deadline or return an in-use buffer
+	// to the pool.
+	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
 	documentScanner := newOpenAISSEJSONDocumentScanner(scanner)
+	pump := newAnthropicNativeLinePump(documentScanner, s.responsesStreamIdleInterval(c))
+	defer func() {
+		pump.stop()
+		_ = resp.Body.Close()
+	}()
+	var streamReadErr error
 
 	needModelReplace := strings.TrimSpace(originalModel) != "" && strings.TrimSpace(mappedModel) != "" && strings.TrimSpace(originalModel) != strings.TrimSpace(mappedModel)
 	resultWithUsage := func() *openaiStreamingResultPassthrough {
@@ -2036,8 +2106,14 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 		}
 	}
 
-	for documentScanner.Scan() {
-		line := documentScanner.Text()
+	for {
+		line, readErr := pump.next()
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				streamReadErr = readErr
+			}
+			break
+		}
 		if eventType, ok := extractOpenAISSEEventLine(line); ok {
 			pendingSSEEventType = eventType
 			eventType = strings.TrimSpace(eventType)
@@ -2266,8 +2342,11 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 			break
 		}
 	}
+	if budgetErr := responsesAttemptError(ctx); budgetErr != nil {
+		return resultWithUsage(), budgetErr
+	}
 	ensureResponseFailedTerminal()
-	if err := documentScanner.Err(); err != nil {
+	if err := streamReadErr; err != nil {
 		if (sawDone || sawTerminalEvent) && !sawFailedEvent {
 			s.clearOpenAIProxyStreamDisconnect(account)
 			return resultWithUsage(), nil

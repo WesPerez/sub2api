@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -84,6 +85,7 @@ func ReadRequestBodyWithPrealloc(req *http.Request) ([]byte, error) {
 	}
 
 	raw, err := readRequestBodyChunks(req.Body, capHint, req.ContentLength)
+	requestbudget.FinishRead(req.Context())
 	if err != nil {
 		return nil, err
 	}

@@ -510,6 +510,7 @@ func isOpenAIHTTPUpstreamAccessStateError(_ int, _ string, body []byte) bool {
 }
 
 func openAICapacityShedClientMessage(upstreamMsg string, body []byte) string {
+	typedCapacity := isOpenAIUpstreamCapacityShedEvent(body)
 	for _, candidate := range []string{
 		upstreamMsg,
 		gjson.GetBytes(body, "error.message").String(),
@@ -517,7 +518,7 @@ func openAICapacityShedClientMessage(upstreamMsg string, body []byte) string {
 		gjson.GetBytes(body, "message").String(),
 	} {
 		candidate = sanitizeUpstreamErrorMessage(strings.TrimSpace(candidate))
-		if candidate != "" && isOpenAICapacityShedMessage(candidate) {
+		if candidate != "" && (typedCapacity || isOpenAICapacityShedMessage(candidate)) {
 			return candidate
 		}
 	}

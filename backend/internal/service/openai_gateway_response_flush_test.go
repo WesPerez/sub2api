@@ -478,8 +478,8 @@ func TestOpenAIResponseFlush_RecentBareErrorAllowsCompletedBeforeIdleTimeout(t *
 	recorder := newOpenAIResponseFlushRecorder()
 	resultCh, errCh := runOpenAIResponseFlushTestAsync(recorder, reader, config.GatewayConfig{StreamDataIntervalTimeout: 1})
 
-	// Place the bare error shortly before the first ticker firing. It is fresh
-	// data, so the ticker must leave the stream open for an authoritative event.
+	// Fresh data moves the idle deadline; the initial timer must leave time
+	// for an authoritative terminal after this error.
 	time.Sleep(700 * time.Millisecond)
 	_, err := io.WriteString(writer, "data: {\"type\":\"error\",\"error\":{\"code\":\"transient\",\"message\":\"retrying\"}}\n\n")
 	require.NoError(t, err)
@@ -495,6 +495,30 @@ func TestOpenAIResponseFlush_RecentBareErrorAllowsCompletedBeforeIdleTimeout(t *
 	gotBody, _ := recorder.snapshot()
 	require.Contains(t, gotBody, `"type":"response.completed"`)
 	require.NotContains(t, gotBody, `"type":"response.failed"`)
+}
+
+func TestOpenAIResponseFlush_IdleDeadlineIsRelativeToLastRead(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer func() { _ = writer.Close() }()
+	recorder := newOpenAIResponseFlushRecorder()
+	resultCh, errCh := runOpenAIResponseFlushTestAsync(recorder, reader, config.GatewayConfig{StreamDataIntervalTimeout: 1})
+	time.Sleep(250 * time.Millisecond)
+	_, err := io.WriteString(writer, "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")
+	require.NoError(t, err)
+	lastRead := time.Now()
+	select {
+	case err := <-errCh:
+		require.ErrorContains(t, err, "stream data interval timeout")
+		require.GreaterOrEqual(t, time.Since(lastRead), 950*time.Millisecond)
+		require.Less(t, time.Since(lastRead), 1500*time.Millisecond, "periodic polling waited for a second whole interval")
+	case <-time.After(1700 * time.Millisecond):
+		t.Fatal("idle stream was not stopped at last-read deadline")
+	}
+	require.NotNil(t, <-resultCh)
+	body, _ := recorder.snapshot()
+	require.Contains(t, body, "partial")
+	require.Contains(t, body, "stream_timeout")
+	require.Equal(t, 1, strings.Count(body, `"type":"response.failed"`))
 }
 
 func TestOpenAIResponseFlush_BareErrorTimeoutSynthesizesFailed(t *testing.T) {

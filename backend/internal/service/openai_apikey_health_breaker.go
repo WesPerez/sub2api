@@ -95,7 +95,7 @@ func (s *RateLimitService) ObserveOpenAIAPIKeyHealthFailure(ctx context.Context,
 		reason = fmt.Sprintf("%s: %d failures in %d minute(s)", openAIAPIKeyHealthBreakerReason, count, settings.WindowMinutes)
 	}
 
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	persistCtx, cancel := openAIResponsesMaintenanceContext(ctx, 3*time.Second)
 	defer cancel()
 	if err := s.accountRepo.SetTempUnschedulable(persistCtx, account.ID, until, reason); err != nil {
 		logger.L().Warn("openai.apikey_health_breaker_persist_failed", zap.Int64("account_id", account.ID), zap.Error(err))

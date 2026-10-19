@@ -482,6 +482,10 @@ const (
 )
 
 func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
+	appendOpsUpstreamErrorWithPolicy(c, ev, true)
+}
+
+func appendOpsUpstreamErrorWithPolicy(c *gin.Context, ev OpsUpstreamErrorEvent, matchPolicy bool) {
 	if c == nil {
 		return
 	}
@@ -514,7 +518,9 @@ func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
 	existing = append(existing, &evCopy)
 	c.Set(OpsUpstreamErrorsKey, existing)
 
-	checkSkipMonitoringForUpstreamEvent(c, &evCopy)
+	if matchPolicy {
+		checkSkipMonitoringForUpstreamEvent(c, &evCopy)
+	}
 }
 
 // opsUpstreamProxyAttribution derives both attribution fields from one

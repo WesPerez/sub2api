@@ -243,6 +243,65 @@ func (s *OpenAIGatewayService) openAIFirstOutputTimeout(reasoningEffort string) 
 	return time.Duration(seconds) * time.Second
 }
 
+type openAIResponsesFirstOutputBudgetKey struct{}
+
+// Carry an absolute pre-output budget without imposing a deadline on a stream
+// that has already started. All account and compatibility attempts share it.
+func WithOpenAIResponsesFirstOutputBudget(ctx context.Context, timeout time.Duration) context.Context {
+	if timeout <= 0 {
+		return ctx
+	}
+	return WithOpenAIResponsesFirstOutputDeadline(ctx, time.Now().Add(timeout))
+}
+
+// Keep an expired deadline enabled: late admission must not reset the budget.
+func WithOpenAIResponsesFirstOutputDeadline(ctx context.Context, deadline time.Time) context.Context {
+	return context.WithValue(ctx, openAIResponsesFirstOutputBudgetKey{}, deadline)
+}
+
+// Use only for bounded pre-output operations, never for a stream or slot lease.
+func OpenAIResponsesPreOutputContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if budget := responsesAttemptFromContext(ctx); budget != nil {
+		return context.WithDeadline(ctx, budget.deadline)
+	}
+	if deadline, ok := ctx.Value(openAIResponsesFirstOutputBudgetKey{}).(time.Time); ok {
+		return context.WithDeadline(ctx, deadline)
+	}
+	return ctx, func() {}
+}
+
+func OpenAIResponsesFirstOutputBudgetRemaining(ctx context.Context) (time.Duration, bool) {
+	deadline, ok := ctx.Value(openAIResponsesFirstOutputBudgetKey{}).(time.Time)
+	return time.Until(deadline), ok
+}
+
+// Failure bookkeeping must survive a client disconnect, but must not start a
+// fresh multi-second wait after the shared first-output budget has expired.
+func openAIResponsesMaintenanceContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if remaining, enabled := OpenAIResponsesFirstOutputBudgetRemaining(ctx); enabled && remaining < timeout {
+		timeout = remaining
+		if timeout < 200*time.Millisecond {
+			timeout = 200 * time.Millisecond
+		}
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), timeout)
+}
+
+func (s *OpenAIGatewayService) openAIFirstOutputAttemptTimeout(ctx context.Context, start time.Time, effort string) time.Duration {
+	timeout := s.openAIFirstOutputTimeout(effort)
+	if remaining, ok := OpenAIResponsesFirstOutputBudgetRemaining(ctx); ok {
+		// Return an elapsed-inclusive duration: callers use start+timeout.
+		budget := time.Since(start) + remaining
+		if budget < time.Nanosecond {
+			budget = time.Nanosecond
+		}
+		if timeout <= 0 || budget < timeout {
+			timeout = budget
+		}
+	}
+	return timeout
+}
+
 // newOpenAIFirstOutputTimeoutError records the timeout as an upstream attempt
 // and returns the failover error. proxyID/proxyName are supplied by the caller
 // because the same deadline is enforced over HTTP and WebSocket transports,
@@ -260,6 +319,16 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 	phase string,
 	responseHeaders http.Header,
 ) *UpstreamFailoverError {
+	if responsesAttemptFromContext(ctx) != nil {
+		// The shared attempt owner records this local timeout once. Logging or
+		// matching upstream error policies here can delay cancellation handoff.
+		return &UpstreamFailoverError{
+			StatusCode:      http.StatusGatewayTimeout,
+			ResponseBody:    []byte(`{"error":{"type":"first_output_timeout","message":"Upstream produced no output before the deadline"}}`),
+			ResponseHeaders: responseHeaders.Clone(), SafeToFailoverAfterWrite: true,
+			FirstOutputTimedOut: true, RequestScopedTransient: true,
+		}
+	}
 	elapsed := time.Since(startTime)
 	logger.LegacyPrintf(
 		"service.openai_gateway",
@@ -275,22 +344,28 @@ func (s *OpenAIGatewayService) newOpenAIFirstOutputTimeoutError(
 		Kind: "first_output_timeout", Message: "OpenAI upstream produced no semantic output before the deadline",
 		Detail: fmt.Sprintf("phase=%s elapsed_ms=%d timeout_ms=%d", phase, elapsed.Milliseconds(), timeout.Milliseconds()),
 	})
-	if s.rateLimitService != nil {
-		s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
+	if s.rateLimitService != nil && responsesAttemptFromContext(ctx) == nil {
+		maintenanceCtx, cancel := openAIResponsesMaintenanceContext(ctx, time.Second)
+		s.rateLimitService.HandleStreamTimeout(maintenanceCtx, account, originalModel)
+		cancel()
 	}
 	return &UpstreamFailoverError{
 		StatusCode:      http.StatusGatewayTimeout,
 		ResponseBody:    []byte(`{"error":{"type":"first_output_timeout","message":"Upstream produced no output before the deadline"}}`),
 		ResponseHeaders: responseHeaders.Clone(), SafeToFailoverAfterWrite: true,
+		FirstOutputTimedOut: true, RequestScopedTransient: responsesAttemptFromContext(ctx) != nil,
 	}
 }
 
 type openAIFirstOutputHeaderGuard struct {
-	cancel  context.CancelFunc
-	release context.CancelFunc
-	timer   *time.Timer
-	fired   chan struct{}
-	once    sync.Once
+	cancel     context.CancelFunc
+	release    context.CancelFunc
+	timer      *time.Timer
+	mu         sync.Mutex
+	stopped    bool
+	timedOut   bool
+	once       sync.Once
+	stopClient func() bool
 }
 
 func newOpenAIFirstOutputHeaderGuard(
@@ -298,30 +373,36 @@ func newOpenAIFirstOutputHeaderGuard(
 	release context.CancelFunc,
 	deadline time.Time,
 ) (context.Context, *openAIFirstOutputHeaderGuard) {
-	guardedCtx, cancel := context.WithCancel(ctx)
-	guard := &openAIFirstOutputHeaderGuard{cancel: cancel, release: release, fired: make(chan struct{})}
+	guardedCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	guard := &openAIFirstOutputHeaderGuard{cancel: cancel, release: release}
+	guard.stopClient = context.AfterFunc(ctx, cancel)
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
 		remaining = time.Nanosecond
 	}
 	guard.timer = time.AfterFunc(remaining, func() {
-		close(guard.fired)
-		cancel()
+		guard.mu.Lock()
+		defer guard.mu.Unlock()
+		if !guard.stopped {
+			guard.timedOut = true
+			cancel()
+		}
 	})
 	return guardedCtx, guard
 }
 
 func (g *openAIFirstOutputHeaderGuard) stopHeaderWait() bool {
-	if g.timer.Stop() {
-		return false
-	}
-	<-g.fired
-	return true
+	g.stopClient()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.stopped = true
+	g.timer.Stop()
+	return g.timedOut
 }
 
 func (g *openAIFirstOutputHeaderGuard) close() {
 	g.once.Do(func() {
-		g.timer.Stop()
+		g.stopHeaderWait()
 		g.cancel()
 		g.release()
 	})
