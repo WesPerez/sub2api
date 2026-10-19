@@ -408,6 +408,34 @@ func normalizeOpenAILongContextBillingUpdateExtra(account *Account, input *Updat
 	return normalized, nil
 }
 
+const defaultOpenAIAPIKeyCreateModel = "gpt-6.1-sol"
+
+// applyOpenAIAPIKeyCreateDefaults adds a conservative model restriction only
+// when the caller omitted model_mapping. An explicit mapping (including an
+// empty object) and OpenAI passthrough are caller decisions and must be kept.
+func applyOpenAIAPIKeyCreateDefaults(input *CreateAccountInput, extra map[string]any) {
+	if input == nil || input.Platform != PlatformOpenAI || input.Type != AccountTypeAPIKey {
+		return
+	}
+	if _, explicit := input.Credentials["model_mapping"]; explicit {
+		return
+	}
+	if enabled, _ := extra["openai_passthrough"].(bool); enabled {
+		return
+	}
+	if enabled, _ := extra["openai_oauth_passthrough"].(bool); enabled {
+		return
+	}
+
+	input.Credentials = maps.Clone(input.Credentials)
+	if input.Credentials == nil {
+		input.Credentials = make(map[string]any, 1)
+	}
+	input.Credentials["model_mapping"] = map[string]any{
+		defaultOpenAIAPIKeyCreateModel: defaultOpenAIAPIKeyCreateModel,
+	}
+}
+
 // Grok media eligibility helpers live in account_grok_media_eligibility.go.
 
 func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]any) (*Account, error) {
@@ -424,6 +452,7 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	delete(accountExtra, OpenCodeGoUsageAutoRefreshExtraKey)
 	delete(accountExtra, OpenCodeGoUsageSnapshotExtraKey)
 	accountExtra = prepareCodexFingerprintExtraForCreate(input.Platform, input.Type, accountExtra)
+	applyOpenAIAPIKeyCreateDefaults(input, accountExtra)
 	account := &Account{
 		Name:        input.Name,
 		Notes:       normalizeAccountNotes(input.Notes),
@@ -435,7 +464,7 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 		Concurrency: normalizeAccountConcurrency(input.Platform, input.Type, input.Concurrency),
 		Priority:    input.Priority,
 		Status:      StatusActive,
-		Schedulable: true,
+		Schedulable: false,
 	}
 	if input.ProbeEnabled != nil && *input.ProbeEnabled {
 		if !isUpstreamBillingProbeAccount(account) {
@@ -1448,7 +1477,7 @@ func (s *adminServiceImpl) CreateShadow(ctx context.Context, parentID int64, opt
 		ProxyID:         parent.ProxyID,
 		Priority:        priority,
 		Concurrency:     concurrency,
-		Schedulable:     true,
+		Schedulable:     false,
 		Extra: map[string]any{
 			openAILongContextBillingEnabledKey: parent.IsOpenAILongContextBillingEnabled(),
 		},

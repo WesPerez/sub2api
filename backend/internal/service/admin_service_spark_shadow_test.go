@@ -144,6 +144,7 @@ func TestCreateShadow(t *testing.T) {
 	shadow, err := svc.CreateShadow(ctx, parent.ID, ShadowOptions{Name: "p-spark", Priority: 50})
 	require.NoError(t, err)
 	require.NotNil(t, shadow)
+	require.False(t, shadow.Schedulable)
 	require.Equal(t, parent.ID, *shadow.ParentAccountID)
 	require.Equal(t, QuotaDimensionSpark, shadow.QuotaDimension)
 	require.Equal(t, defaultSparkShadowModelMapping(), shadow.Credentials["model_mapping"],
@@ -191,7 +192,7 @@ func TestCreateShadowInheritsParentEffectiveOpenAILongContextBillingValue(t *tes
 }
 
 // TestCreateShadow_BindGroups は BindGroups の後置呼び出しを検証する。
-// 影子账号が指定グループに属し、ListSchedulableByGroupID で取得可能であること。
+// The shadow account is bound to the requested group while remaining unschedulable as a new account.
 func TestCreateShadow_BindGroups(t *testing.T) {
 	ctx := context.Background()
 	repo := newSparkShadowRepoStub()
@@ -217,10 +218,8 @@ func TestCreateShadow_BindGroups(t *testing.T) {
 	require.NotNil(t, shadow)
 	require.Equal(t, []int64{testGroupID}, shadow.GroupIDs, "CreateShadow should backfill GroupIDs into the returned shadow")
 
-	accounts, err := repo.ListSchedulableByGroupID(ctx, testGroupID)
-	require.NoError(t, err)
-	require.Len(t, accounts, 1)
-	require.Equal(t, shadow.ID, accounts[0].ID)
+	require.Equal(t, []int64{testGroupID}, repo.groupsOf[shadow.ID])
+	require.False(t, repo.accounts[shadow.ID].Schedulable)
 }
 
 // TestDeleteAccount_CascadeToShadow verifies that deleting a parent account also

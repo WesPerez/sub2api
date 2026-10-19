@@ -538,6 +538,15 @@ export function getModelsByPlatform(platform: string): string[] {
   }
 }
 
+export const DEFAULT_OPENAI_API_KEY_CREATE_MODELS = ['gpt-6.1-sol'] as const
+
+export function getDefaultModelsForCreate(platform: string, type: string): string[] {
+  if (platform === 'openai' && type === 'apikey') {
+    return [...DEFAULT_OPENAI_API_KEY_CREATE_MODELS]
+  }
+  return [...getModelsByPlatform(platform)]
+}
+
 // 按平台获取预设映射
 export function getPresetMappingsByPlatform(platform: string) {
   if (platform === 'openai') return openaiPresetMappings

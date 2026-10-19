@@ -388,7 +388,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: concurrency,
 				Priority:    priority,
 				Status:      status,
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"
@@ -524,7 +524,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: concurrency,
 				Priority:    priority,
 				Status:      status,
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"
@@ -679,7 +679,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: concurrency,
 				Priority:    priority,
 				Status:      status,
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"
@@ -830,7 +830,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: concurrency,
 				Priority:    priority,
 				Status:      status,
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"
@@ -960,7 +960,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: 3,
 				Priority:    clampPriority(src.Priority),
 				Status:      mapCRSStatus(src.IsActive, src.Status),
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"
@@ -1090,7 +1090,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 				Concurrency: 3,
 				Priority:    clampPriority(src.Priority),
 				Status:      mapCRSStatus(src.IsActive, src.Status),
-				Schedulable: src.Schedulable,
+				Schedulable: false,
 			}
 			if err := s.accountRepo.Create(ctx, account); err != nil {
 				item.Action = "failed"

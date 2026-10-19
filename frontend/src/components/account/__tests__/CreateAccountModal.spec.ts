@@ -131,11 +131,18 @@ const ModelWhitelistSelectorStub = defineComponent({
     syncCredentials: Object,
   },
   emits: ['update:modelValue', 'upstream-synced'],
-  template: `<button
-    type="button"
-    data-testid="model-whitelist-selector"
-    @click="$emit('update:modelValue', ['public-glm']); $emit('upstream-synced')"
-  >models</button>`,
+  template: `<div>
+    <button
+      type="button"
+      data-testid="model-whitelist-selector"
+      @click="$emit('update:modelValue', ['public-glm']); $emit('upstream-synced')"
+    >models</button>
+    <button
+      type="button"
+      data-testid="model-whitelist-clear"
+      @click="$emit('update:modelValue', [])"
+    >clear</button>
+  </div>`,
 })
 
 function mountModal(groups: any[] = []) {
@@ -294,6 +301,52 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
 
     expect(createAccountMock).toHaveBeenCalledTimes(1)
     expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBe(false)
+  })
+
+  it('preselects and submits only gpt-6.1-sol for a new OpenAI API key account', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+
+    expect(wrapper.getComponent(ModelWhitelistSelectorStub).props('modelValue')).toEqual([
+      'gpt-6.1-sol'
+    ])
+
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('openai account')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock.mock.calls[0]?.[0]?.credentials?.model_mapping).toEqual({
+      'gpt-6.1-sol': 'gpt-6.1-sol'
+    })
+  })
+
+  it('submits an explicit empty OpenAI API key model mapping', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+    await wrapper.get('[data-testid="model-whitelist-clear"]').trigger('click')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('openai account')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock.mock.calls[0]?.[0]?.credentials?.model_mapping).toEqual({})
+  })
+
+  it('keeps OpenAI passthrough selected without adding a default model mapping', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await selectButtonByText(wrapper, 'API Key')
+    await wrapper.get('[data-testid="openai-passthrough-toggle"]').trigger('click')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('openai account')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('test-api-key')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_passthrough).toBe(true)
+    expect(createAccountMock.mock.calls[0]?.[0]?.credentials).not.toHaveProperty('model_mapping')
   })
 
   it('omits the upstream request id header from extra when left empty', async () => {

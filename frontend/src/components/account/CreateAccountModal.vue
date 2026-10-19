@@ -3299,6 +3299,7 @@
           </div>
           <button
             type="button"
+            data-testid="openai-passthrough-toggle"
             @click="openaiPassthroughEnabled = !openaiPassthroughEnabled"
             :class="[
               'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
@@ -4117,9 +4118,8 @@ import { useI18n } from 'vue-i18n'
 import { useAppStore } from '@/stores/app'
 
 import {
-  claudeModels,
   getPresetMappingsByPlatform,
-  getModelsByPlatform,
+  getDefaultModelsForCreate,
   commonErrorCodes,
   buildModelMappingObject,
   fetchAntigravityDefaultMappings,
@@ -5086,7 +5086,7 @@ watch(
         .then(profiles => { tlsFingerprintProfiles.value = profiles.map(p => ({ id: p.id, name: p.name })) })
         .catch(() => { tlsFingerprintProfiles.value = [] })
       // Modal opened - fill related models
-      allowedModels.value = [...getModelsByPlatform(form.platform)]
+      allowedModels.value = getDefaultModelsForCreate(form.platform, form.type)
       // Antigravity: 默认使用映射模式并填充默认映射
       if (form.platform === 'antigravity') {
         antigravityModelRestrictionMode.value = 'mapping'
@@ -5278,12 +5278,24 @@ const handleSelectGeminiOAuthType = (oauthType: 'code_assist' | 'google_one' | '
   geminiOAuthType.value = oauthType
 }
 
-// Auto-fill related models when switching to whitelist mode or changing platform
+// Auto-fill related models when changing platform. Switching restriction mode
+// preserves the user's current selection, including an explicit empty list.
 watch(
-  [modelRestrictionMode, () => form.platform],
-  ([newMode]) => {
-    if (newMode === 'whitelist') {
-      allowedModels.value = [...getModelsByPlatform(form.platform)]
+  () => form.platform,
+  () => {
+    allowedModels.value = getDefaultModelsForCreate(form.platform, form.type)
+  }
+)
+
+watch(
+  () => form.type,
+  (newType, oldType) => {
+    if (
+      newType !== oldType &&
+      newType === 'apikey' &&
+      form.platform === 'openai'
+    ) {
+      allowedModels.value = getDefaultModelsForCreate(form.platform, newType)
     }
   }
 )
@@ -5644,7 +5656,7 @@ const resetForm = () => {
   modelMappings.value = []
   openAICompactModelMappings.value = []
   modelRestrictionMode.value = 'whitelist'
-  allowedModels.value = [...claudeModels] // Default fill related models
+  allowedModels.value = getDefaultModelsForCreate(form.platform, form.type)
 
   antigravityModelRestrictionMode.value = 'mapping'
   antigravityWhitelistModels.value = []
@@ -6163,8 +6175,8 @@ const handleSubmit = async () => {
   // Add model mapping if configured（OpenAI 开启自动透传时不应用）
   if (!isOpenAIModelRestrictionDisabled.value) {
     const modelMapping = buildModelMappingObject(modelRestrictionMode.value, allowedModels.value, modelMappings.value)
-    if (modelMapping) {
-      credentials.model_mapping = modelMapping
+    if (modelMapping || form.platform === 'openai') {
+      credentials.model_mapping = modelMapping ?? {}
     }
   }
   if (form.platform === 'openai') {

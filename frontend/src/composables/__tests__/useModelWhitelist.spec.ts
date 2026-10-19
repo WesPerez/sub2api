@@ -4,8 +4,14 @@ vi.mock('@/api/admin/accounts', () => ({
   getAntigravityDefaultModelMapping: vi.fn()
 }))
 
-import { buildModelMappingObject, getModelsByPlatform, getPresetMappingsByPlatform, splitModelMappingObject } from '../useModelWhitelist'
 import { BUILTIN_PLATFORM_CATALOG, resetPlatformCatalog, setPlatformCatalog } from '@/constants/platformCatalog'
+import {
+  buildModelMappingObject,
+  getDefaultModelsForCreate,
+  getModelsByPlatform,
+  getPresetMappingsByPlatform,
+  splitModelMappingObject
+} from '../useModelWhitelist'
 
 describe('useModelWhitelist', () => {
   it('平台清单中没有内置模型列表的多协议供应商不预填白名单', () => {
@@ -49,6 +55,13 @@ describe('useModelWhitelist', () => {
     expect(models).toContain('gpt-6.1-sol')
     expect(models).toContain('gpt-6-sol')
     expect(models).toContain('gpt-6-luna')
+  })
+
+  it('OpenAI API Key 仅预选 GPT-6.1 Sol，同时保留完整模型目录', () => {
+    expect(getDefaultModelsForCreate('openai', 'apikey')).toEqual(['gpt-6.1-sol'])
+    expect(getModelsByPlatform('openai').length).toBeGreaterThan(1)
+    expect(getModelsByPlatform('openai')).toContain('gpt-6')
+    expect(getModelsByPlatform('openai')).toContain('gpt-6.1-sol')
   })
 
   it('openai 预设映射包含 GPT-6 别名和 Astra', () => {
