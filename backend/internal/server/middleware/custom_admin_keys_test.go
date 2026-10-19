@@ -174,7 +174,7 @@ func TestAdminFullAccessKeepsIdentityAndJWTBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		method, path string
 		status       int
-	}{{"GET", "/api/v1/admin/future", 204}, {"POST", "/api/v1/admin/settings/admin-api-keys", 403}, {"GET", "/api/v1/admin/interactive", 403}} {
+	}{{"GET", "/api/v1/admin/future", 204}, {"GET", "/api/v1/admin/future?account_search=private-upstream", 204}, {"POST", "/api/v1/admin/settings/admin-api-keys", 403}, {"GET", "/api/v1/admin/interactive", 403}} {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(tc.method, tc.path, nil)
 		req.Header.Set("x-api-key", key)

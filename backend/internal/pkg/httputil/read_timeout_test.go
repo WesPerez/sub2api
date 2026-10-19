@@ -10,7 +10,71 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 )
+
+func TestBodyReadTimeoutPreservesResponsesIngressDeadline(t *testing.T) {
+	readDone := make(chan error, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := io.ReadAll(r.Body)
+		readDone <- err
+	})
+	srv := httptest.NewServer(requestbudget.Wrap(WithBodyReadTimeout(handler, 5*time.Second), 100*time.Millisecond))
+	defer srv.Close()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, "POST /v1/responses HTTP/1.1\r\nHost: test\r\nContent-Length: 1024\r\n\r\nx"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-readDone:
+		var timeout net.Error
+		if !errors.As(err, &timeout) || !timeout.Timeout() {
+			t.Fatalf("want ingress upload timeout, got %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("per-read timeout extended the Responses ingress deadline")
+	}
+}
+
+func TestResponsesIngressCleanupPreservesEarlierReadTimeout(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, err := ReadRequestBodyWithPrealloc(r)
+		if err == nil {
+			t.Error("stalled upload unexpectedly completed")
+		}
+		w.WriteHeader(http.StatusBadRequest)
+	})
+	srv := httptest.NewUnstartedServer(requestbudget.Wrap(WithBodyReadTimeout(handler, 100*time.Millisecond), 5*time.Second))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateClosed {
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, "POST /v1/responses HTTP/1.1\r\nHost: test\r\nContent-Length: 1024\r\n\r\nx"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("ingress cleanup cleared the failed read deadline before HTTP1 drain")
+	}
+}
 
 func TestBodyReadTimeoutReleasesStalledUpload(t *testing.T) {
 	readDone := make(chan error, 1)

@@ -218,6 +218,8 @@ func (s *OpenAIGatewayService) resolveOpenAIProfitControlGate(ctx context.Contex
 	if s == nil || groupID == nil || *groupID <= 0 {
 		return nil
 	}
+	ctx, cancel := OpenAIResponsesPreOutputContext(ctx)
+	defer cancel()
 	// 门配置取被调度分组。直连请求（ctx 认证分组即调度分组，生产绝大多数流量）
 	// 直接复用 auth cache 分组，热路径零额外查询；composite 父分组路由到成员
 	// 分组等 ID 不一致场景才回源仓库读取。auth 快照的分组字段完备性由

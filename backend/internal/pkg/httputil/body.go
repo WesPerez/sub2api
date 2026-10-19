@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 	"github.com/klauspost/compress/zstd"
 )
 
@@ -110,6 +111,7 @@ func readRequestBodyWithBudget(req *http.Request) (requestBodyBuffer, error) {
 
 	startedAt := time.Now()
 	raw, err := readRequestBodyChunksWithBudget(req.Context(), req.Body, capHint, req.ContentLength)
+	requestbudget.FinishRead(req.Context())
 	if err != nil {
 		var readErr *RequestBodyReadError
 		if errors.As(err, &readErr) {

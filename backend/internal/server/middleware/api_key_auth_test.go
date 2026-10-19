@@ -3,23 +3,101 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+type ingressBudgetLogGate struct {
+	entered chan struct{}
+	resume  chan struct{}
+}
+
+func (w *ingressBudgetLogGate) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("openai.first_output_retry_budget_exhausted")) {
+		close(w.entered)
+		<-w.resume
+	}
+	return len(p), nil
+}
+
+func (*ingressBudgetLogGate) Sync() error { return nil }
+
+func TestResponsesIngressSlowAuthenticationReturnsBudgetTimeout(t *testing.T) {
+	gate := &ingressBudgetLogGate{entered: make(chan struct{}), resume: make(chan struct{})}
+	cleanupEntered, cleanupResume := make(chan struct{}), make(chan struct{})
+	var logOnce, cleanupOnce sync.Once
+	resumeLog := func() { logOnce.Do(func() { close(gate.resume) }) }
+	resumeCleanup := func() { cleanupOnce.Do(func() { close(cleanupResume) }) }
+	log := zap.New(zapcore.NewCore(zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig()), gate, zapcore.DebugLevel))
+	repo := &stubApiKeyRepo{getByKey: func(ctx context.Context, _ string) (*service.APIKey, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	cfg := &config.Config{RunMode: config.RunModeSimple}
+	svc := service.NewAPIKeyService(repo, nil, nil, nil, nil, nil, cfg)
+	r := gin.New()
+	r.Use(Logger(), func(c *gin.Context) {
+		c.Request = c.Request.WithContext(logger.IntoContext(c.Request.Context(), log))
+		c.Next()
+		close(cleanupEntered)
+		<-cleanupResume
+	}, gin.HandlerFunc(NewAPIKeyAuthMiddleware(svc, nil, cfg)))
+	var forwarded atomic.Int32
+	r.POST("/responses", func(c *gin.Context) { forwarded.Add(1); c.Status(200) })
+	server := httptest.NewServer(requestbudget.Wrap(r, 60*time.Millisecond))
+	defer server.Close()
+	defer resumeCleanup()
+	defer resumeLog()
+	req, err := http.NewRequest("POST", server.URL+"/responses", strings.NewReader(`{"stream":true}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer budget-test")
+	client := server.Client()
+	client.Timeout = 2 * time.Second
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusGatewayTimeout, resp.StatusCode)
+	require.Contains(t, string(body), "first_output_timeout")
+	require.Equal(t, int64(len(body)), resp.ContentLength)
+	require.Zero(t, forwarded.Load())
+	select {
+	case <-gate.entered:
+	case <-time.After(time.Second):
+		t.Fatal("timeout logger was not reached")
+	}
+	// The complete HTTP body arrived while both log I/O and the subsequent
+	// middleware return path were still blocked.
+	resumeLog()
+	select {
+	case <-cleanupEntered:
+	case <-time.After(time.Second):
+		t.Fatal("middleware cleanup was not reached")
+	}
+	resumeCleanup()
+}
 
 func TestAPIKeyAuthRejectsOversizedCredentialsBeforeLookup(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1159,6 +1237,7 @@ func TestAPIKeyAuthTouchesLastUsedOnSuccess(t *testing.T) {
 		User:   user,
 	}
 
+	touchDone := make(chan struct{})
 	var touchedID int64
 	var touchedAt time.Time
 	apiKeyRepo := &stubApiKeyRepo{
@@ -1172,6 +1251,7 @@ func TestAPIKeyAuthTouchesLastUsedOnSuccess(t *testing.T) {
 		updateLastUsed: func(ctx context.Context, id int64, usedAt time.Time) error {
 			touchedID = id
 			touchedAt = usedAt
+			close(touchDone)
 			return nil
 		},
 	}
@@ -1186,6 +1266,11 @@ func TestAPIKeyAuthTouchesLastUsedOnSuccess(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
+	select {
+	case <-touchDone:
+	case <-time.After(time.Second):
+		t.Fatal("background last-used write did not run")
+	}
 	require.Equal(t, apiKey.ID, touchedID)
 	require.False(t, touchedAt.IsZero(), "expected touch timestamp")
 }
@@ -1208,7 +1293,7 @@ func TestAPIKeyAuthTouchLastUsedFailureDoesNotBlock(t *testing.T) {
 		User:   user,
 	}
 
-	touchCalls := 0
+	var touchCalls atomic.Int32
 	apiKeyRepo := &stubApiKeyRepo{
 		getByKey: func(ctx context.Context, key string) (*service.APIKey, error) {
 			if key != apiKey.Key {
@@ -1218,7 +1303,7 @@ func TestAPIKeyAuthTouchLastUsedFailureDoesNotBlock(t *testing.T) {
 			return &clone, nil
 		},
 		updateLastUsed: func(ctx context.Context, id int64, usedAt time.Time) error {
-			touchCalls++
+			touchCalls.Add(1)
 			return errors.New("db unavailable")
 		},
 	}
@@ -1233,7 +1318,7 @@ func TestAPIKeyAuthTouchLastUsedFailureDoesNotBlock(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code, "touch failure should not block request")
-	require.Equal(t, 1, touchCalls)
+	require.Eventually(t, func() bool { return touchCalls.Load() == 1 }, time.Second, time.Millisecond)
 }
 
 func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
@@ -1254,7 +1339,7 @@ func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
 		User:   user,
 	}
 
-	touchCalls := 0
+	var touchCalls atomic.Int32
 	apiKeyRepo := &stubApiKeyRepo{
 		getByKey: func(ctx context.Context, key string) (*service.APIKey, error) {
 			if key != apiKey.Key {
@@ -1264,7 +1349,7 @@ func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
 			return &clone, nil
 		},
 		updateLastUsed: func(ctx context.Context, id int64, usedAt time.Time) error {
-			touchCalls++
+			touchCalls.Add(1)
 			return nil
 		},
 	}
@@ -1279,7 +1364,7 @@ func TestAPIKeyAuthTouchesLastUsedInStandardMode(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, 1, touchCalls)
+	require.Eventually(t, func() bool { return touchCalls.Load() == 1 }, time.Second, time.Millisecond)
 }
 
 func TestAPIKeyAuthBillingInfoSkipsBillingAndSideEffects(t *testing.T) {
@@ -1381,14 +1466,14 @@ func TestAPIKeyAuthUsageStillTouchesLastUsed(t *testing.T) {
 
 	user := &service.User{ID: 7, Role: service.RoleUser, Status: service.StatusActive, Balance: 10}
 	apiKey := &service.APIKey{ID: 100, UserID: user.ID, Key: "usage-touch", Status: service.StatusActive, User: user}
-	touchCalls := 0
+	var touchCalls atomic.Int32
 	apiKeyRepo := &stubApiKeyRepo{
 		getByKey: func(context.Context, string) (*service.APIKey, error) {
 			clone := *apiKey
 			return &clone, nil
 		},
 		updateLastUsed: func(context.Context, int64, time.Time) error {
-			touchCalls++
+			touchCalls.Add(1)
 			return nil
 		},
 	}
@@ -1402,7 +1487,7 @@ func TestAPIKeyAuthUsageStillTouchesLastUsed(t *testing.T) {
 	router.ServeHTTP(w, req)
 
 	require.Equal(t, http.StatusOK, w.Code)
-	require.Equal(t, 1, touchCalls)
+	require.Eventually(t, func() bool { return touchCalls.Load() == 1 }, time.Second, time.Millisecond)
 }
 
 func TestAPIKeyAuthAllowsBalanceBelowMinimumReserve(t *testing.T) {

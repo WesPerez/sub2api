@@ -181,7 +181,7 @@ func (s *SettingService) GetCyberSessionBlockRuntime(ctx context.Context) (bool,
 			return cached.enabled, cached.ttl
 		}
 	}
-	result, _, _ := s.cyberSessionBlockRuntimeSF.Do("cyber_session_block_runtime", func() (any, error) {
+	result, _, _ := doContextSingleflight(ctx, &s.cyberSessionBlockRuntimeSF, "cyber_session_block_runtime", func() (any, error) {
 		s.cyberSessionBlockRuntimeMu.Lock()
 		defer s.cyberSessionBlockRuntimeMu.Unlock()
 		if cached, ok := s.cyberSessionBlockRuntimeCache.Load().(*cachedCyberSessionBlockRuntime); ok && cached != nil {
@@ -300,7 +300,7 @@ func (s *SettingService) GetOpenAICodexUserAgent(ctx context.Context) string {
 		}
 	}
 
-	result, _, _ := s.openAICodexUASF.Do("openai_codex_user_agent", func() (any, error) {
+	result, _, _ := doContextSingleflight(ctx, &s.openAICodexUASF, "openai_codex_user_agent", func() (any, error) {
 		if cached, ok := s.openAICodexUACache.Load().(*cachedOpenAICodexUserAgent); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return cached.value, nil
@@ -352,7 +352,7 @@ func (s *SettingService) GetOpenAICodexClientVersion(ctx context.Context) string
 		}
 	}
 
-	result, _, _ := s.openAICodexVersionSF.Do(openAICodexClientVersionSFKey, func() (any, error) {
+	result, _, _ := doContextSingleflight(ctx, &s.openAICodexVersionSF, openAICodexClientVersionSFKey, func() (any, error) {
 		if cached, ok := s.openAICodexVersionCache.Load().(*cachedOpenAICodexClientVersion); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return cached.version, nil
@@ -708,7 +708,7 @@ func (s *SettingService) GetCodexRestrictionPolicy(ctx context.Context) CodexRes
 			return cached.value
 		}
 	}
-	result, _, _ := s.codexRestrictionPolicySF.Do("codex_restriction_policy", func() (any, error) {
+	result, _, _ := doContextSingleflight(ctx, &s.codexRestrictionPolicySF, "codex_restriction_policy", func() (any, error) {
 		if cached, ok := s.codexRestrictionPolicyCache.Load().(*cachedCodexRestrictionPolicy); ok && cached != nil {
 			if time.Now().UnixNano() < cached.expiresAt {
 				return cached.value, nil

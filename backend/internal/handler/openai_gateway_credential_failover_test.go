@@ -438,3 +438,27 @@ func TestOpsWebSocketCredentialFailoverExhaustedIsRecorded(t *testing.T) {
 	require.Equal(t, http.StatusServiceUnavailable, job.entry.StatusCode)
 	require.Equal(t, service.GrokCredentialUnavailableClientMessage, job.entry.ErrorMessage)
 }
+
+func TestOpenAIUnauthorizedClientStopsWithoutAccountSideEffects(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	failure := &service.UpstreamFailoverError{
+		StatusCode: 401, Stage: service.GatewayFailureStageAccountAuth, Scope: service.GatewayFailureScopeRequest,
+		Reason: service.OpenAIUnauthorizedClientReason, NextAccountAction: service.NextAccountStop,
+		ClientStatusCode: 400, ClientMessage: service.OpenAIUnauthorizedClientMessage,
+		ResponseBody: []byte(`{"error":{"message":"sensitive upstream detail"}}`),
+	}
+	state := NewFailoverState(12, false)
+	scheduler := &mockTempUnscheduler{}
+	require.Equal(t, FailoverExhausted, state.HandleFailoverError(context.Background(), scheduler, 71, service.PlatformOpenAI, 5, failure))
+	require.Zero(t, state.SwitchCount)
+	require.Empty(t, state.FailedAccountIDs)
+	require.Empty(t, state.SameAccountRetryCount)
+	require.Empty(t, scheduler.calls)
+	require.False(t, failure.ShouldReportAccountScheduleFailure())
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	(&OpenAIGatewayHandler{}).handleFailoverExhausted(c, failure, false)
+	require.Equal(t, 400, rec.Code)
+	require.Contains(t, rec.Body.String(), service.OpenAIUnauthorizedClientMessage)
+	require.NotContains(t, rec.Body.String(), "sensitive upstream detail")
+}

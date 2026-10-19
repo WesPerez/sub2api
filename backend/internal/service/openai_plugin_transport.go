@@ -1,6 +1,13 @@
 package service
 
-import "net/http"
+import (
+	"context"
+	"io"
+	"net/http"
+	"sync"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/resinrecovery"
+)
 
 func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 	s.pluginManager = manager
@@ -8,7 +15,22 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 
 // doOpenAIUpstream 只在 OpenAI OAuth 能力绑定已启用时把真实请求交给插件。
 // 插件返回标准 http.Response，响应解析、错误映射、SSE 和计费仍由现有核心链处理。
-func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (response *http.Response, err error) {
+	if budget := responsesAttemptFromContext(request.Context()); budget != nil {
+		if err := budget.err(); err != nil {
+			return nil, err
+		}
+		request = request.WithContext(responsesBudgetTransportContext{Context: budget.ctx, values: request.Context()})
+		defer func() {
+			if response == nil || response.Body == nil {
+				return
+			}
+			body := response.Body
+			closed := &responsesBudgetBody{ReadCloser: body}
+			stop := context.AfterFunc(budget.ctx, func() { _ = closed.Close() })
+			response.Body = resinrecovery.PreserveBodyObservation(&openAIRequestContextReadCloser{ReadCloser: closed, cleanup: func() { stop() }}, body)
+		}()
+	}
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)
 		if handled {
@@ -16,6 +38,17 @@ func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL 
 		}
 	}
 	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+}
+
+type responsesBudgetBody struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func (b *responsesBudgetBody) Close() error {
+	b.once.Do(func() { b.err = b.ReadCloser.Close() })
+	return b.err
 }
 
 // doOpenAIAccountTestUpstream 让 OpenAI OAuth 账号测试与真实转发使用同一插件路径。

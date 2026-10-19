@@ -8,6 +8,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/requestmodel"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -191,6 +192,10 @@ func RegisterGatewayRoutes(
 				h.OpenAIGateway.ResponsesInputTokens(c)
 				return
 			}
+			if middleware.AbortResponsesIngressExpired(c) {
+				return
+			}
+			c.Request = c.Request.WithContext(requestbudget.RestoreLifecycle(c.Request.Context()))
 			next(c)
 		}
 	}
@@ -232,6 +237,10 @@ func RegisterGatewayRoutes(
 		gateway.GET("/live/:call_id", h.OpenAIGateway.LiveSideband)
 		// OpenAI Responses API: auto-route based on group platform
 		gateway.POST("/responses", func(c *gin.Context) {
+			if middleware.AbortResponsesIngressExpired(c) {
+				return
+			}
+			c.Request = c.Request.WithContext(requestbudget.RestoreLifecycle(c.Request.Context()))
 			if isOpenAIResponsesCompatibleGatewayPlatform(c) {
 				h.OpenAIGateway.Responses(c)
 				return
@@ -380,6 +389,10 @@ func RegisterGatewayRoutes(
 
 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
 	responsesHandler := func(c *gin.Context) {
+		if middleware.AbortResponsesIngressExpired(c) {
+			return
+		}
+		c.Request = c.Request.WithContext(requestbudget.RestoreLifecycle(c.Request.Context()))
 		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
 			h.OpenAIGateway.Responses(c)
 			return
@@ -574,6 +587,7 @@ func compositeTargetPlatformMiddleware(resolver *service.CompositeRouteResolver)
 		resolver = service.NewCompositeRouteResolver(nil)
 	}
 	return func(c *gin.Context) {
+		middleware.MarkGatewayStage(c, "allowlist_done")
 		apiKey, ok := middleware.GetAPIKeyFromContext(c)
 		if !ok || apiKey == nil || apiKey.Group == nil || apiKey.Group.Platform != service.PlatformComposite {
 			c.Next()
@@ -585,7 +599,11 @@ func compositeTargetPlatformMiddleware(resolver *service.CompositeRouteResolver)
 		}
 
 		body, err := pkghttputil.ReadRequestBodyWithPrealloc(c.Request)
+		middleware.MarkGatewayStage(c, "composite_body_ready")
 		if err != nil {
+			if middleware.AbortResponsesIngressExpired(c) {
+				return
+			}
 			if middleware.RejectRequestBodyReadError(c, "middleware.composite_route", err) {
 				return
 			}
@@ -599,6 +617,10 @@ func compositeTargetPlatformMiddleware(resolver *service.CompositeRouteResolver)
 		model := requestmodel.FromBodyForRoute(routePath, c.GetHeader("Content-Type"), body)
 		if model != "" {
 			decision, err := resolver.Resolve(c.Request.Context(), apiKey.Group.ID, model, compositeRouteEndpointForPath(c.Request.URL.Path))
+			middleware.MarkGatewayStage(c, "composite_resolved")
+			if middleware.AbortResponsesIngressExpired(c) {
+				return
+			}
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"type": "server_error", "message": "Failed to resolve composite model route"}})
 				c.Abort()

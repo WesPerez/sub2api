@@ -118,6 +118,12 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		}
 		return false
 	}
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && isOpenAISessionBindingInvalidated(statusCode, responseBody) {
+		return false
+	}
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && isOpenAIUnauthorizedClientError(statusCode, responseBody) {
+		return false
+	}
 	stateCtx, cancel := openAIAccountStateContext(ctx)
 	defer cancel()
 	if account != nil && account.Platform == PlatformOpenAI && isOpenAIHTTPUpstreamAccessStateError(statusCode, "", responseBody) {

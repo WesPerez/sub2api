@@ -112,10 +112,16 @@ func isResponsesWebSocketRoute(c *gin.Context) bool {
 func groupModelAllowlistModelsFromBody(c *gin.Context) ([]string, bool) {
 	body, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
+		if AbortResponsesIngressExpired(c) {
+			return nil, false
+		}
 		if RejectRequestBodyReadError(c, "middleware.group_model_allowlist", err) {
 			return nil, false
 		}
 		AbortWithRequestBodyReadFailure(c, "middleware.group_model_allowlist", err)
+		return nil, false
+	}
+	if AbortResponsesIngressExpired(c) {
 		return nil, false
 	}
 	requestmodel.ResetRequestBody(c.Request, body)

@@ -14,6 +14,50 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type budgetSlowUserGroupRateRepo struct {
+	UserGroupRateRepository
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *budgetSlowUserGroupRateRepo) GetByUserAndGroup(ctx context.Context, _, _ int64) (*float64, error) {
+	close(r.entered)
+	select {
+	case <-r.release:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestPricingPreparationRespectsFirstOutputBudget(t *testing.T) {
+	repo := &budgetSlowUserGroupRateRepo{entered: make(chan struct{}), release: make(chan struct{})}
+	defer close(repo.release)
+	svc := &OpenAIGatewayService{userGroupRateResolver: newUserGroupRateResolver(repo, nil, time.Minute, nil, "test")}
+	group := profitControlTestGroup(7, 0.3, 0)
+	ctx := context.WithValue(profitControlTestCtx(group), ctxkey.UserID, int64(1))
+	ctx = WithOpenAIResponsesFirstOutputBudget(ctx, 200*time.Millisecond)
+	done := make(chan context.Context, 1)
+	go func() {
+		prepared, _ := svc.WithOpenAIRequestPricingContext(ctx, &group.ID)
+		done <- prepared
+	}()
+	select {
+	case <-repo.entered:
+	case <-time.After(time.Second):
+		t.Fatal("pricing repository was not entered")
+	}
+	select {
+	case prepared := <-done:
+		require.NoError(t, prepared.Err(), "pricing values must preserve the stream lifecycle")
+		remaining, enabled := OpenAIResponsesFirstOutputBudgetRemaining(prepared)
+		require.True(t, enabled)
+		require.LessOrEqual(t, remaining, time.Duration(0))
+	case <-time.After(time.Second):
+		t.Fatal("pricing cache miss exceeded the shared budget")
+	}
+}
+
 func profitControlTestGroup(id int64, margin, buffer float64) *Group {
 	return &Group{
 		ID:                   id,

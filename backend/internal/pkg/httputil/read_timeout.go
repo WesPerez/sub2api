@@ -2,12 +2,15 @@ package httputil
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
+
+	"github.com/Wei-Shaw/sub2api/internal/pkg/requestbudget"
 )
 
 // WithBodyReadTimeout bounds each socket read while receiving a body. It does
@@ -18,7 +21,7 @@ func WithBodyReadTimeout(next http.Handler, timeout time.Duration) http.Handler 
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Body != nil && r.Body != http.NoBody {
-			body := &bodyReadTimeout{ReadCloser: r.Body, controller: http.NewResponseController(w), timeout: timeout}
+			body := &bodyReadTimeout{ReadCloser: r.Body, controller: http.NewResponseController(w), timeout: timeout, ctx: r.Context()}
 			r.Body = body
 			if r.ProtoMajor == 1 {
 				writer := &bodyDrainTimeoutWriter{ResponseWriter: w, body: body}
@@ -41,12 +44,19 @@ type bodyReadTimeout struct {
 	io.ReadCloser
 	controller *http.ResponseController
 	timeout    time.Duration
+	ctx        context.Context
 	finished   atomic.Bool
 	failed     atomic.Bool
 }
 
 func (r *bodyReadTimeout) Read(p []byte) (int, error) {
-	err := r.controller.SetReadDeadline(time.Now().Add(r.timeout))
+	deadline := time.Now().Add(r.timeout)
+	if r.ctx != nil {
+		if budgetDeadline, ok := requestbudget.Deadline(r.ctx); ok && budgetDeadline.Before(deadline) {
+			deadline = budgetDeadline
+		}
+	}
+	err := r.controller.SetReadDeadline(deadline)
 	if err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return 0, err
 	}
@@ -55,6 +65,9 @@ func (r *bodyReadTimeout) Read(p []byte) (int, error) {
 		r.finished.Store(true)
 	} else if readErr != nil {
 		r.failed.Store(true)
+		if r.ctx != nil {
+			requestbudget.PreserveFailedReadDeadline(r.ctx)
+		}
 	}
 	if readErr == nil || errors.Is(readErr, io.EOF) {
 		_ = r.controller.SetReadDeadline(time.Time{})

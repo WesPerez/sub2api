@@ -41,6 +41,12 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 	body []byte,
 	defaultMappedModel string,
 ) (*OpenAIForwardResult, error) {
+	lifecycleCtx := ctx
+	ctx, cancelPreparation := OpenAIResponsesPreOutputContext(ctx)
+	defer cancelPreparation()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	startTime := time.Now()
 	SetActualOpenAIUpstreamEndpoint(c, "/v1/messages")
 
@@ -116,6 +122,10 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 		proxyURL = account.Proxy.URL()
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	ctx = lifecycleCtx
 	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
 	upstreamReq, forwardedBody, err := s.buildNativeAnthropicUpstreamRequest(upstreamCtx, c, account, anthropicBody, apiKey, targetURL, body)
 	releaseUpstreamCtx()
@@ -134,6 +144,9 @@ func (s *OpenAIGatewayService) forwardResponsesViaNativeAnthropic(
 
 	if resp.StatusCode >= 400 {
 		respBody, upstreamMsg := s.readOpenAIUpstreamError(resp)
+		if budgetErr := responsesAttemptError(ctx); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if foErr := s.failoverOpenAIUpstreamHTTPError(ctx, c, account, resp, respBody, upstreamMsg, upstreamModel); foErr != nil {
 			return nil, foErr
 		}
@@ -198,6 +211,9 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 
 	for {
 		line, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
@@ -212,6 +228,9 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 		}
 
 		dataLine, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
@@ -264,6 +283,9 @@ func (s *OpenAIGatewayService) handleResponsesBufferedFromNativeAnthropic(
 					finalResp.Content[idx].Input = appendRawJSON(finalResp.Content[idx].Input, event.Delta.PartialJSON)
 				}
 			}
+		}
+		if event.Type == "message_stop" {
+			break
 		}
 	}
 
@@ -456,6 +478,9 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 
 	for {
 		line, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return resultWithUsage(), budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
@@ -469,6 +494,9 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 		}
 
 		dataLine, rerr := pump.next()
+		if budgetErr := responsesAttemptError(c.Request.Context()); budgetErr != nil {
+			return nil, budgetErr
+		}
 		if rerr != nil {
 			if errors.Is(rerr, errAnthropicNativeStreamIdle) {
 				return onIdle()
@@ -493,6 +521,12 @@ func (s *OpenAIGatewayService) handleResponsesStreamingFromNativeAnthropic(
 		}
 
 		processAnthropicEvent(&event)
+		if state.CompletedSent {
+			// message_stop already contains the final protocol decision and
+			// usage. Waiting for EOF can turn a completed response into an idle
+			// failure if the provider keeps the transport open.
+			break
+		}
 	}
 
 	if failure := streamStatus.failure(); failure != nil {
