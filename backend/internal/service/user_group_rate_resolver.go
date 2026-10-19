@@ -60,7 +60,7 @@ func (r *userGroupRateResolver) Resolve(ctx context.Context, userID, groupID int
 	}
 	userGroupRateCacheMissTotal.Add(1)
 
-	value, err, shared := r.sf.Do(key, func() (any, error) {
+	value, err, shared := doContextSingleflight(ctx, r.sf, key, func() (any, error) {
 		if r.cache != nil {
 			if cached, ok := r.cache.Get(key); ok {
 				if multiplier, castOK := cached.(float64); castOK {
@@ -71,7 +71,9 @@ func (r *userGroupRateResolver) Resolve(ctx context.Context, userID, groupID int
 		}
 
 		userGroupRateCacheLoadTotal.Add(1)
-		userRate, repoErr := r.repo.GetByUserAndGroup(ctx, userID, groupID)
+		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		userRate, repoErr := r.repo.GetByUserAndGroup(refreshCtx, userID, groupID)
 		if repoErr != nil {
 			return nil, repoErr
 		}

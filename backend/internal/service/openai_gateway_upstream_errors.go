@@ -319,6 +319,9 @@ func (s *OpenAIGatewayService) shouldFailoverOpenAIUpstreamResponse(account *Acc
 	if isOpenAIContextWindowError(upstreamMsg, upstreamBody) {
 		return false
 	}
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && isOpenAISessionBindingInvalidated(statusCode, upstreamBody) {
+		return true
+	}
 	if isOpenAIHTTPUpstreamAccessStateError(statusCode, upstreamMsg, upstreamBody) {
 		return true
 	}
@@ -375,6 +378,19 @@ func IsOpenAICompatibleModelNotFound400(respBody []byte) bool {
 const OpenAIRequestBodyTooLargeClientMessage = "Request payload is too large"
 
 const openAIRequestBodyTooLargeReason = GatewayFailureReason("openai_request_body_too_large")
+
+const OpenAIUnauthorizedClientReason = GatewayFailureReason("openai_unauthorized_client")
+const OpenAIUnauthorizedClientMessage = "The upstream does not accept this client implementation"
+
+// This gateway rejects the client implementation, not the selected credential.
+// Require the observed structured signature; generic 401s keep their existing
+// credential policy and echoed request text is never authentication evidence.
+func isOpenAIUnauthorizedClientError(statusCode int, body []byte) bool {
+	return statusCode == http.StatusUnauthorized && gjson.ValidBytes(body) &&
+		gjson.GetBytes(body, "type").String() == "unauthorized_client_error" &&
+		gjson.GetBytes(body, "message").String() == "UNAUTHENTICATED" &&
+		strings.HasPrefix(gjson.GetBytes(body, "error.message").String(), "unauthorized client detected,")
+}
 
 func isOpenAIRequestBodyTooLargeError(statusCode int, upstreamMsg string, upstreamBody []byte) bool {
 	return statusCode == http.StatusRequestEntityTooLarge && !isOpenAIContextWindowError(upstreamMsg, upstreamBody)
@@ -455,6 +471,25 @@ func (s *OpenAIGatewayService) newOpenAIAccountFailoverErrorWithClassificationHe
 		upstreamMsg,
 		retryableOnSameAccount || oauth429Retry,
 	)
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && isOpenAIUnauthorizedClientError(statusCode, responseBody) {
+		failoverErr.RetryableOnSameAccount = false
+		failoverErr.RequestScopedTransient = true
+		failoverErr.Stage = GatewayFailureStageAccountAuth
+		failoverErr.Scope = GatewayFailureScopeRequest
+		failoverErr.Reason = OpenAIUnauthorizedClientReason
+		failoverErr.NextAccountAction = NextAccountStop
+		failoverErr.ClientStatusCode = http.StatusBadRequest
+		failoverErr.ClientMessage = OpenAIUnauthorizedClientMessage
+	}
+	if account != nil && account.Platform == PlatformOpenAI && account.Type == AccountTypeAPIKey && isOpenAISessionBindingInvalidated(statusCode, responseBody) {
+		failoverErr.RetryableOnSameAccount = false
+		failoverErr.RequestScopedTransient = true
+		failoverErr.Scope = GatewayFailureScopeRequest
+		failoverErr.Reason = openAISessionBindingInvalidatedReason
+		failoverErr.NextAccountAction = NextAccountRetry
+		failoverErr.ClientStatusCode = http.StatusBadGateway
+		failoverErr.ClientMessage = "Upstream session binding is unavailable"
+	}
 	if oauth429Retry {
 		failoverErr.SameAccountRetryDeadline = s.openAIOAuth429RetryDeadline(account)
 		failoverErr.SameAccountRetryDelay = openAIOAuth429SameAccountRetryDelay(responseHeaders, failoverErr.SameAccountRetryDeadline)
@@ -510,6 +545,7 @@ func isOpenAIHTTPUpstreamAccessStateError(_ int, _ string, body []byte) bool {
 }
 
 func openAICapacityShedClientMessage(upstreamMsg string, body []byte) string {
+	typedCapacity := isOpenAIUpstreamCapacityShedEvent(body)
 	for _, candidate := range []string{
 		upstreamMsg,
 		gjson.GetBytes(body, "error.message").String(),
@@ -517,7 +553,7 @@ func openAICapacityShedClientMessage(upstreamMsg string, body []byte) string {
 		gjson.GetBytes(body, "message").String(),
 	} {
 		candidate = sanitizeUpstreamErrorMessage(strings.TrimSpace(candidate))
-		if candidate != "" && isOpenAICapacityShedMessage(candidate) {
+		if candidate != "" && (typedCapacity || isOpenAICapacityShedMessage(candidate)) {
 			return candidate
 		}
 	}
@@ -647,7 +683,6 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 			truncateForLog(body, s.cfg.Gateway.LogUpstreamErrorBodyMaxBytes),
 		)
 	}
-
 	if isOpenAIRequestBodyTooLargeError(resp.StatusCode, upstreamMsg, body) {
 		appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
 			ProxyID:            opsUpstreamProxyID(account),

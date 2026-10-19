@@ -16,12 +16,12 @@ package service
 // 关闭 resp.Body 解除阻塞的读并结束排水。
 
 import (
-	"bufio"
 	"errors"
 	"io"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/gin-gonic/gin"
 )
 
 // errAnthropicNativeStreamIdle 表示上游流读间隔超时（见上方文件注释）。
@@ -48,7 +48,13 @@ type anthropicNativeLinePump struct {
 }
 
 // newAnthropicNativeLinePump 启动泵 goroutine；调用方 defer pump.stop()。
-func newAnthropicNativeLinePump(scanner *bufio.Scanner, interval time.Duration) *anthropicNativeLinePump {
+type upstreamLineScanner interface {
+	Scan() bool
+	Text() string
+	Err() error
+}
+
+func newAnthropicNativeLinePump(scanner upstreamLineScanner, interval time.Duration) *anthropicNativeLinePump {
 	p := &anthropicNativeLinePump{
 		events:   make(chan anthropicNativeLineEvent, 16),
 		done:     make(chan struct{}),
@@ -159,4 +165,11 @@ func anthropicNativeStreamInterval(cfg *config.Config) time.Duration {
 		return time.Duration(cfg.Gateway.StreamDataIntervalTimeout) * time.Second
 	}
 	return 0
+}
+
+func (s *OpenAIGatewayService) responsesStreamIdleInterval(c *gin.Context) time.Duration {
+	if imageIntent, _ := getOpenAIImageIntentHint(c); imageIntent {
+		return s.openAIImageStreamDataInterval()
+	}
+	return anthropicNativeStreamInterval(s.cfg)
 }

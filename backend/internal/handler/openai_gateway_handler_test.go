@@ -2055,29 +2055,30 @@ func (u *openAIHTTPPassthroughAuthFailoverUpstream) calls() []int64 {
 
 type openAIHTTPPassthroughSSERateLimitUpstream struct {
 	service.HTTPUpstream
-	mu         sync.Mutex
-	accountIDs []int64
+	mu             sync.Mutex
+	accountIDs     []int64
+	eventData      string
+	successOnRetry bool
 }
 
 func (u *openAIHTTPPassthroughSSERateLimitUpstream) Do(_ *http.Request, _ string, accountID int64, _ int) (*http.Response, error) {
 	u.mu.Lock()
 	u.accountIDs = append(u.accountIDs, accountID)
+	attempt := len(u.accountIDs)
 	u.mu.Unlock()
-	body := strings.Join([]string{
-		"event: response.created",
-		`data: {"type":"response.created","response":{"id":"resp_rate_limited"}}`,
-		"",
-		"event: response.failed",
-		`data: {"type":"response.failed","response":{"id":"resp_rate_limited","status":"failed","error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}`,
-		"",
-	}, "\n")
+	eventData := u.eventData
+	if eventData == "" {
+		eventData = `{"type":"response.failed","response":{"id":"resp_rate_limited","status":"failed","error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}`
+	}
+	body := "event: response.created\ndata: " + `{"type":"response.created","response":{"id":"resp_rate_limited","status":"in_progress","output":[],"metadata":{"padding":"` + strings.Repeat("x", 40*1024) + `"}}}` + "\n\n" +
+		"event: " + gjson.Get(eventData, "type").String() + "\ndata: " + eventData + "\n\n"
+	if u.successOnRetry && attempt > 1 {
+		body = "event: response.completed\ndata: " + `{"type":"response.completed","response":{"id":"resp_recovered","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"
+	}
 	return &http.Response{
 		StatusCode: http.StatusOK,
-		Header: http.Header{
-			"Content-Type": []string{"text/event-stream"},
-			"Retry-After":  []string{"1"},
-		},
-		Body: io.NopCloser(strings.NewReader(body)),
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "Retry-After": []string{"1"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}, nil
 }
 
@@ -2391,84 +2392,115 @@ func TestOpenAIResponses_APIKeyPassthroughPoolAuthFailureRetriesThenSwitchesToHe
 
 func TestOpenAIResponses_APIKeyPassthroughSSERateLimitUsesConfiguredPoolRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	groupID := int64(4204)
-	accounts := []service.Account{
+	for _, tc := range []struct {
+		name           string
+		eventData      string
+		successOnRetry bool
+	}{
 		{
-			ID: 9912, Name: "pool-sse-rate-limit", Platform: service.PlatformOpenAI,
-			Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 1,
-			Credentials: map[string]any{
-				"api_key":                      "sk-pool",
-				"base_url":                     "https://api.example.test",
-				"pool_mode":                    true,
-				"pool_mode_retry_count":        float64(1),
-				"pool_mode_retry_status_codes": []any{float64(http.StatusTooManyRequests)},
-			},
-			Extra: map[string]any{"openai_passthrough": true},
+			name:      "nested response failed",
+			eventData: `{"type":"response.failed","response":{"id":"resp_rate_limited","status":"failed","error":{"code":"rate_limit_exceeded","message":"Concurrency limit exceeded for account, please retry later"}}}`,
 		},
+		{
+			name:      "top-level error after metadata preamble",
+			eventData: `{"type":"error","sequence_number":1,"code":"rate_limit_exceeded","message":"Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit.","param":null}`,
+		},
+		{
+			name:           "top-level error recovers on retry",
+			eventData:      `{"type":"error","code":"rate_limit_exceeded","message":"Your requests to gpt-6-astra for gpt-6-astra in eastus2 have exceeded token rate limit."}`,
+			successOnRetry: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			groupID := int64(4204)
+			accounts := []service.Account{
+				{
+					ID: 9912, Name: "pool-sse-rate-limit", Platform: service.PlatformOpenAI,
+					Type: service.AccountTypeAPIKey, Status: service.StatusActive, Schedulable: true, Priority: 1,
+					Credentials: map[string]any{
+						"api_key":                      "sk-pool",
+						"base_url":                     "https://api.example.test",
+						"pool_mode":                    true,
+						"pool_mode_retry_count":        float64(1),
+						"pool_mode_retry_status_codes": []any{float64(http.StatusTooManyRequests)},
+					},
+					Extra: map[string]any{"openai_passthrough": true},
+				},
+			}
+			cfg := &config.Config{RunMode: config.RunModeSimple}
+			cfg.Default.RateMultiplier = 1
+			cfg.Security.URLAllowlist.Enabled = false
+			cfg.Gateway.MaxAccountSwitches = 1
+
+			accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
+			upstream := &openAIHTTPPassthroughSSERateLimitUpstream{eventData: tc.eventData, successOnRetry: tc.successOnRetry}
+			billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
+			t.Cleanup(billingCacheSvc.Stop)
+			gatewaySvc := service.NewOpenAIGatewayService(
+				accountRepo,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				cfg,
+				nil,
+				nil,
+				service.NewBillingService(cfg, nil),
+				nil,
+				billingCacheSvc,
+				upstream,
+				&service.DeferredService{},
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+				nil,
+			)
+			h := NewOpenAIGatewayHandler(
+				gatewaySvc,
+				service.NewConcurrencyService(nil),
+				billingCacheSvc,
+				service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
+				nil,
+				nil,
+				nil,
+				nil,
+				cfg,
+			)
+
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`))
+			c.Request.Header.Set("Content-Type", "application/json")
+			c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
+				ID: 1804, GroupID: &groupID,
+				User:  &service.User{ID: 1704, Status: service.StatusActive},
+				Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
+			})
+			c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1704, Concurrency: 0})
+
+			h.Responses(c)
+
+			require.Equal(t, []int64{9912, 9912}, upstream.calls())
+			if tc.successOnRetry {
+				require.Equal(t, http.StatusOK, rec.Code)
+				require.Contains(t, rec.Body.String(), "resp_recovered")
+				require.Contains(t, rec.Body.String(), "Recovered")
+				require.Contains(t, rec.Body.String(), "response.completed")
+				require.NotContains(t, rec.Body.String(), "rate_limit_exceeded")
+				require.NotContains(t, rec.Body.String(), "resp_rate_limited")
+				return
+			}
+			require.Equal(t, http.StatusTooManyRequests, rec.Code)
+			require.Equal(t, "1", rec.Header().Get("Retry-After"))
+			require.Equal(t, "rate_limit_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
+			require.Equal(t, "Upstream rate limit exceeded, please retry later", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
+		})
 	}
-	cfg := &config.Config{RunMode: config.RunModeSimple}
-	cfg.Default.RateMultiplier = 1
-	cfg.Security.URLAllowlist.Enabled = false
-	cfg.Gateway.MaxAccountSwitches = 1
-
-	accountRepo := &openAIWSFailoverHandlerAccountRepoStub{accounts: accounts}
-	upstream := &openAIHTTPPassthroughSSERateLimitUpstream{}
-	billingCacheSvc := service.NewBillingCacheService(nil, nil, nil, nil, nil, nil, cfg, nil)
-	t.Cleanup(billingCacheSvc.Stop)
-	gatewaySvc := service.NewOpenAIGatewayService(
-		accountRepo,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		cfg,
-		nil,
-		nil,
-		service.NewBillingService(cfg, nil),
-		nil,
-		billingCacheSvc,
-		upstream,
-		&service.DeferredService{},
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-		nil,
-	)
-	h := NewOpenAIGatewayHandler(
-		gatewaySvc,
-		service.NewConcurrencyService(nil),
-		billingCacheSvc,
-		service.NewAPIKeyService(nil, nil, nil, nil, nil, nil, cfg),
-		nil,
-		nil,
-		nil,
-		nil,
-		cfg,
-	)
-
-	rec := httptest.NewRecorder()
-	c, _ := gin.CreateTestContext(rec)
-	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","input":"hello","stream":true}`))
-	c.Request.Header.Set("Content-Type", "application/json")
-	c.Set(string(middleware.ContextKeyAPIKey), &service.APIKey{
-		ID: 1804, GroupID: &groupID,
-		User:  &service.User{ID: 1704, Status: service.StatusActive},
-		Group: &service.Group{ID: groupID, Platform: service.PlatformOpenAI, Status: service.StatusActive},
-	})
-	c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: 1704, Concurrency: 0})
-
-	h.Responses(c)
-
-	require.Equal(t, []int64{9912, 9912}, upstream.calls())
-	require.Equal(t, http.StatusTooManyRequests, rec.Code)
-	require.Equal(t, "1", rec.Header().Get("Retry-After"))
-	require.Equal(t, "rate_limit_error", gjson.GetBytes(rec.Body.Bytes(), "error.type").String())
-	require.Equal(t, "Upstream rate limit exceeded, please retry later", gjson.GetBytes(rec.Body.Bytes(), "error.message").String())
 }
 
 func TestOpenAIResponsesWebSocket_FailoverOnUpstreamUsageLimitEvent(t *testing.T) {

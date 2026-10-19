@@ -113,6 +113,9 @@ func isResponsesWebSocketRoute(c *gin.Context) bool {
 func groupModelAllowlistModelsFromBody(c *gin.Context) ([]string, bool) {
 	body, err := httputil.ReadRequestBodyWithPrealloc(c.Request)
 	if err != nil {
+		if AbortResponsesIngressExpired(c) {
+			return nil, false
+		}
 		status := http.StatusBadRequest
 		message := "Failed to read request body"
 		var maxErr *http.MaxBytesError
@@ -122,6 +125,9 @@ func groupModelAllowlistModelsFromBody(c *gin.Context) ([]string, bool) {
 		}
 		c.JSON(status, gin.H{"error": gin.H{"type": "invalid_request_error", "message": message}})
 		c.Abort()
+		return nil, false
+	}
+	if AbortResponsesIngressExpired(c) {
 		return nil, false
 	}
 	requestmodel.ResetRequestBody(c.Request, body)

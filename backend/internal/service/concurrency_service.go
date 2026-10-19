@@ -596,12 +596,12 @@ func (s *ConcurrencyService) getAccountsLoadBatch(ctx context.Context, accounts 
 		return cached, nil
 	}
 
-	value, err, _ := s.accountLoadGroup.Do(key, func() (any, error) {
+	value, err, _ := doContextSingleflight(ctx, &s.accountLoadGroup, key, func() (any, error) {
 		now := time.Now()
 		if cached, ok := s.getCachedAccountLoadBatch(key, now); ok {
 			return cached, nil
 		}
-		loadMap, fetchErr := s.fetchAccountsLoadBatch(ctx, accounts)
+		loadMap, fetchErr := s.fetchAccountsLoadBatch(context.WithoutCancel(ctx), accounts)
 		if fetchErr != nil {
 			return nil, fetchErr
 		}
@@ -625,7 +625,7 @@ func (s *ConcurrencyService) fetchAccountsLoadBatch(ctx context.Context, account
 	}
 	baseCtx := context.Background()
 	if ctx != nil {
-		baseCtx = context.WithoutCancel(ctx)
+		baseCtx = ctx
 	}
 	redisCtx, cancel := context.WithTimeout(baseCtx, accountLoadBatchFetchTimeout)
 	defer cancel()

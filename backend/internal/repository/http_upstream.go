@@ -331,17 +331,27 @@ func doUpstreamRequest(client *http.Client, req *http.Request) (*http.Response, 
 
 type cancelOnCloseBody struct {
 	io.ReadCloser
-	cancel context.CancelFunc
-	once   sync.Once
-	err    error
-	readMu sync.Mutex
-	closed bool
+	cancel        context.CancelFunc
+	once          sync.Once
+	err           error
+	readMu        sync.Mutex
+	closed        atomic.Bool
+	closeDone     chan struct{}
+	closeDeadline time.Time
+	warnOnce      sync.Once
 }
 
+const upstreamBodyCloseWait = 500 * time.Millisecond
+
+var errUpstreamBodyClosePending = errors.New("upstream body cleanup continues after its close deadline")
+
 func (b *cancelOnCloseBody) Read(p []byte) (int, error) {
+	if b.closed.Load() {
+		return 0, http.ErrBodyReadAfterClose
+	}
 	b.readMu.Lock()
 	defer b.readMu.Unlock()
-	if b.closed {
+	if b.closed.Load() {
 		return 0, http.ErrBodyReadAfterClose
 	}
 	return b.ReadCloser.Read(p)
@@ -354,16 +364,50 @@ func (b *cancelOnCloseBody) Close() error {
 		// EOF waiter on a reused connection and stall subsequent responses.
 		// Fully consumed responses have already released their transport request,
 		// so cancelling here preserves normal keep-alive reuse.
+		b.closed.Store(true)
+		b.closeDone = make(chan struct{})
+		b.closeDeadline = time.Now().Add(upstreamBodyCloseWait)
 		b.cancel()
 		// Wait for an active read to observe cancellation before touching the
-		// body or decompressor. Do not hold readMu while cancelling the request.
-		b.readMu.Lock()
-		defer b.readMu.Unlock()
-		b.closed = true
-		b.err = b.ReadCloser.Close()
+		// decompressor, but do not hold failover hostage to a stalled reader.
+		// This one owner also covers later Close calls; never close/read a
+		// decompressor concurrently or reuse an incompletely closed attempt.
+		go func() {
+			defer close(b.closeDone)
+			b.readMu.Lock()
+			defer b.readMu.Unlock()
+			b.err = b.ReadCloser.Close()
+		}()
 	})
-	return b.err
+	select {
+	case <-b.closeDone:
+		return b.err
+	default:
+	}
+	remaining := time.Until(b.closeDeadline)
+	if remaining <= 0 {
+		return b.closePending()
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-b.closeDone:
+		return b.err
+	case <-timer.C:
+		return b.closePending()
+	}
 }
+
+func (b *cancelOnCloseBody) closePending() error {
+	b.warnOnce.Do(func() {
+		slog.Warn("upstream body cleanup pending after cancellation; retaining transport in-flight accounting", "wait_ms", upstreamBodyCloseWait.Milliseconds())
+	})
+	return errUpstreamBodyClosePending
+}
+
+// Only transport accounting waits for physical cleanup. Request handlers may
+// release their canceled attempt without waiting on an unresponsive reader.
+func (b *cancelOnCloseBody) CloseDone() <-chan struct{} { return b.closeDone }
 
 // httpClientForUpstreamRequest 按请求上下文的标记派生客户端：禁用重定向，或对重定向的每一跳做主机校验。
 // 派生的克隆与缓存客户端共享 Transport；未打标记时原样返回。
@@ -1529,7 +1573,17 @@ type trackedBody struct {
 func (b *trackedBody) Close() error {
 	err := b.ReadCloser.Close()
 	if b.onClose != nil {
-		b.once.Do(b.onClose)
+		b.once.Do(func() {
+			if body, ok := b.ReadCloser.(interface{ CloseDone() <-chan struct{} }); ok {
+				select {
+				case <-body.CloseDone():
+				default:
+					go func() { <-body.CloseDone(); b.onClose() }()
+					return
+				}
+			}
+			b.onClose()
+		})
 	}
 	return err
 }

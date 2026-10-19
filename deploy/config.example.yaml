@@ -238,6 +238,10 @@ gateway:
   openai_first_output_timeout_seconds: 0
   # Optional high/xhigh/max override (seconds, 0=use the standard timeout)
   openai_high_effort_first_output_timeout_seconds: 0
+  # Shared no-output waiting budget across HTTP Responses account retries (0=disabled).
+  # Use 60 seconds above and 120 here to allow a bounded recovery attempt.
+  # Does not limit total stream duration once semantic output starts.
+  openai_responses_first_output_budget_seconds: 0
   # Max request body size in bytes (default: 256MB)
   # 请求体最大字节数（默认 256MB）
   max_body_size: 268435456

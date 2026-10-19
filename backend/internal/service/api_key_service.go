@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
+	"log/slog"
 	"math"
 	"sort"
 	"strconv"
@@ -52,6 +53,8 @@ const (
 	apiKeyMaxErrorsPerHour       = 20
 	apiKeyCreateCountWindow      = time.Hour
 	apiKeyLastUsedMinTouch       = 30 * time.Second
+	apiKeyLastUsedWriteTimeout   = 2 * time.Second
+	apiKeyLastUsedMaxConcurrent  = 4
 	apiKeySortCurrentConcurrency = "current_concurrency"
 	// DB 写失败后的短退避，避免请求路径持续同步重试造成写风暴与高延迟。
 	apiKeyLastUsedFailBackoff = 5 * time.Second
@@ -314,6 +317,8 @@ type APIKeyService struct {
 	authInvalidationFailures  atomic.Uint64
 	lastUsedTouchL1           sync.Map // keyID -> nextAllowedAt(time.Time)
 	lastUsedTouchSF           singleflight.Group
+	lastUsedTouchPending      sync.Map // keyID -> background write already admitted
+	lastUsedTouchActive       atomic.Int32
 }
 
 type APIKeyAuthLookupMetrics struct {
@@ -751,8 +756,10 @@ func (s *APIKeyService) GetByKey(ctx context.Context, key string) (*APIKey, erro
 	}
 
 	if s.authCfg.singleflight {
-		value, err, _ := s.authGroup.Do(cacheKey, func() (any, error) {
-			return s.loadAuthCacheEntry(ctx, key, cacheKey)
+		value, err, _ := doContextSingleflight(ctx, &s.authGroup, cacheKey, func() (any, error) {
+			refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			return s.loadAuthCacheEntry(refreshCtx, key, cacheKey)
 		})
 		if err != nil {
 			return nil, err
@@ -994,36 +1001,72 @@ func (s *APIKeyService) ValidateKey(ctx context.Context, key string) (*APIKey, *
 	return apiKey, user, nil
 }
 
-// TouchLastUsed 通过防抖更新 api_keys.last_used_at，减少高频写放大。
-// 该操作为尽力而为，不应阻塞主请求链路。
-func (s *APIKeyService) TouchLastUsed(ctx context.Context, keyID int64) error {
-	if keyID <= 0 {
-		return nil
+// TouchLastUsedAsync schedules best-effort metadata outside authentication.
+// Deduplicate before starting a goroutine and drop work when all four slots
+// are occupied: a slow database must not queue requests or unbounded workers.
+func (s *APIKeyService) TouchLastUsedAsync(ctx context.Context, keyID int64) {
+	if keyID <= 0 || ctx.Err() != nil || s.lastUsedTouchDebounced(keyID, time.Now()) {
+		return
 	}
+	if _, loaded := s.lastUsedTouchPending.LoadOrStore(keyID, struct{}{}); loaded {
+		return
+	}
+	if s.lastUsedTouchActive.Add(1) > apiKeyLastUsedMaxConcurrent {
+		s.lastUsedTouchActive.Add(-1)
+		s.lastUsedTouchPending.Delete(keyID)
+		return
+	}
+	go func() {
+		defer s.lastUsedTouchActive.Add(-1)
+		defer s.lastUsedTouchPending.Delete(keyID)
+		defer func() {
+			if recover() != nil {
+				s.lastUsedTouchL1.Store(keyID, time.Now().Add(apiKeyLastUsedFailBackoff))
+				slog.Error("api_key_last_used_background_panic", "api_key_id", keyID)
+			}
+		}()
+		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), apiKeyLastUsedWriteTimeout)
+		defer cancel()
+		// Keep the slot until the actual write exits, even if a repository fails
+		// to honor cancellation. DoChan would release it before that work ended.
+		_, _, _ = s.lastUsedTouchSF.Do(strconv.FormatInt(keyID, 10), func() (any, error) {
+			return nil, s.touchLastUsed(writeCtx, keyID)
+		})
+	}()
+}
 
-	now := time.Now()
+func (s *APIKeyService) lastUsedTouchDebounced(keyID int64, now time.Time) bool {
 	if v, ok := s.lastUsedTouchL1.Load(keyID); ok {
 		if nextAllowedAt, ok := v.(time.Time); ok && now.Before(nextAllowedAt) {
-			return nil
+			return true
 		}
 	}
+	return false
+}
 
-	_, err, _ := s.lastUsedTouchSF.Do(strconv.FormatInt(keyID, 10), func() (any, error) {
-		latest := time.Now()
-		if v, ok := s.lastUsedTouchL1.Load(keyID); ok {
-			if nextAllowedAt, ok := v.(time.Time); ok && latest.Before(nextAllowedAt) {
-				return nil, nil
-			}
-		}
-
-		if err := s.apiKeyRepo.UpdateLastUsed(ctx, keyID, latest); err != nil {
-			s.lastUsedTouchL1.Store(keyID, latest.Add(apiKeyLastUsedFailBackoff))
-			return nil, fmt.Errorf("touch api key last used: %w", err)
-		}
-		s.lastUsedTouchL1.Store(keyID, latest.Add(apiKeyLastUsedMinTouch))
-		return nil, nil
+// TouchLastUsed synchronously updates debounced metadata. Authentication must
+// use TouchLastUsedAsync so metadata persistence cannot delay admission.
+func (s *APIKeyService) TouchLastUsed(ctx context.Context, keyID int64) error {
+	if keyID <= 0 || s.lastUsedTouchDebounced(keyID, time.Now()) {
+		return nil
+	}
+	_, err, _ := doContextSingleflight(ctx, &s.lastUsedTouchSF, strconv.FormatInt(keyID, 10), func() (any, error) {
+		return nil, s.touchLastUsed(ctx, keyID)
 	})
 	return err
+}
+
+func (s *APIKeyService) touchLastUsed(ctx context.Context, keyID int64) error {
+	latest := time.Now()
+	if s.lastUsedTouchDebounced(keyID, latest) {
+		return nil
+	}
+	if err := s.apiKeyRepo.UpdateLastUsed(ctx, keyID, latest); err != nil {
+		s.lastUsedTouchL1.Store(keyID, time.Now().Add(apiKeyLastUsedFailBackoff))
+		return fmt.Errorf("touch api key last used: %w", err)
+	}
+	s.lastUsedTouchL1.Store(keyID, time.Now().Add(apiKeyLastUsedMinTouch))
+	return nil
 }
 
 // IncrementUsage 增加API Key使用次数（可选：用于统计）

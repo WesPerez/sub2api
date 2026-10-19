@@ -288,8 +288,19 @@ func (s *OpenAIGatewayService) scanCCStream(
 	var st ccStreamScanState
 
 	scanner := s.newUpstreamSSEScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
+	pump := newAnthropicNativeLinePump(scanner, s.responsesStreamIdleInterval(c))
+	defer func() {
+		pump.stop()
+		_ = resp.Body.Close()
+	}()
+	for {
+		line, readErr := pump.next()
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				st.Err = readErr
+			}
+			break
+		}
 		payload, ok := extractOpenAISSEDataLine(line)
 		if !ok {
 			continue
@@ -328,7 +339,7 @@ func (s *OpenAIGatewayService) scanCCStream(
 		emit(&chunk)
 	}
 
-	if err := scanner.Err(); err != nil {
+	if err := st.Err; err != nil {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			logger.L().Warn(logPrefix+": stream read error",
 				zap.Error(err),

@@ -19,6 +19,82 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+type stalledLifecycleBody struct {
+	readStarted  chan struct{}
+	readRelease  chan struct{}
+	closeRelease chan struct{}
+	closed       atomic.Int32
+}
+
+func (b *stalledLifecycleBody) Read([]byte) (int, error) {
+	close(b.readStarted)
+	<-b.readRelease
+	return 0, io.EOF
+}
+func (b *stalledLifecycleBody) Close() error {
+	if b.closeRelease != nil {
+		<-b.closeRelease
+	}
+	b.closed.Add(1)
+	return nil
+}
+
+func TestHTTPUpstreamCloseBoundsStalledReadAndPreservesAccounting(t *testing.T) {
+	for _, stalledRead := range []bool{true, false} {
+		t.Run(fmt.Sprintf("stalled_read=%v", stalledRead), func(t *testing.T) {
+			source := &stalledLifecycleBody{readStarted: make(chan struct{}), readRelease: make(chan struct{})}
+			if !stalledRead {
+				source.closeRelease = make(chan struct{})
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			body := &cancelOnCloseBody{ReadCloser: source, cancel: cancel}
+			var releases atomic.Int32
+			tracked := wrapTrackedBody(body, func() { releases.Add(1) })
+			readDone := make(chan struct{})
+			if stalledRead {
+				go func() { _, _ = tracked.Read(make([]byte, 1)); close(readDone) }()
+				<-source.readStarted
+			}
+			var releaseOnce sync.Once
+			release := func() {
+				releaseOnce.Do(func() {
+					if stalledRead {
+						close(source.readRelease)
+					} else {
+						close(source.closeRelease)
+					}
+				})
+			}
+			defer func() {
+				release()
+				select {
+				case <-body.CloseDone():
+				case <-time.After(time.Second):
+					t.Error("cleanup owner did not finish")
+				}
+			}()
+			started := time.Now()
+			require.ErrorIs(t, tracked.Close(), errUpstreamBodyClosePending)
+			require.Less(t, time.Since(started), time.Second)
+			require.ErrorIs(t, ctx.Err(), context.Canceled)
+			require.Zero(t, releases.Load(), "client accounting must retain the unfinished close")
+			started = time.Now()
+			require.ErrorIs(t, tracked.Close(), errUpstreamBodyClosePending)
+			require.Less(t, time.Since(started), 100*time.Millisecond, "second Close must not reset the deadline")
+			_, err := tracked.Read(make([]byte, 1))
+			require.ErrorIs(t, err, http.ErrBodyReadAfterClose)
+			release()
+			if stalledRead {
+				<-readDone
+			}
+			require.Eventually(t, func() bool { return releases.Load() == 1 }, time.Second, time.Millisecond)
+			require.NoError(t, tracked.Close())
+			require.EqualValues(t, 1, source.closed.Load())
+			require.EqualValues(t, 1, releases.Load())
+		})
+	}
+}
+
 // Exercise both public entry points. The TLS case uses the test server's trusted
 // transport so the test remains local and does not depend on system trust roots.
 func lifecycleClient(t *testing.T, srv *httptest.Server, withTLS bool) (*httpUpstreamService, func(*http.Request) (*http.Response, error)) {
