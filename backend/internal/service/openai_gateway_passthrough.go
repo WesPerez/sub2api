@@ -1301,6 +1301,11 @@ func openAIStreamFailedEventErrorCode(payload []byte) string {
 	if code == "" {
 		code = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "error.code").String()))
 	}
+	if code == "" && gjson.GetBytes(payload, "type").String() == "error" {
+		// Responses error events use top-level code/message fields. The message
+		// need not contain the machine code (for example, "token rate limit").
+		code = strings.ToLower(strings.TrimSpace(gjson.GetBytes(payload, "code").String()))
+	}
 	return code
 }
 
@@ -1360,10 +1365,17 @@ func sanitizeOpenAICapacityShedErrorCodeForClient(payload []byte) ([]byte, bool)
 	}
 	updated := payload
 	changed := false
-	for _, path := range []string{"response.error.code", "error.code"} {
-		parent := strings.TrimSuffix(path, ".code")
-		if !gjson.GetBytes(updated, parent).Exists() {
-			continue
+	for _, path := range []string{"response.error.code", "error.code", "code"} {
+		if path == "code" {
+			if gjson.GetBytes(updated, "type").String() != "error" ||
+				!gjson.GetBytes(updated, path).Exists() {
+				continue
+			}
+		} else {
+			parent := strings.TrimSuffix(path, ".code")
+			if !gjson.GetBytes(updated, parent).Exists() {
+				continue
+			}
 		}
 		code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(updated, path).String()))
 		if code != "" && code != "server_is_overloaded" && code != "slow_down" {
