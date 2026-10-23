@@ -366,6 +366,11 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	imageCount := 0
 	var imageOutputSizes []string
 	for {
+		// An in-flight response may outlive the client to drain terminal usage,
+		// but a disconnected client must not start another compatibility attempt.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		actualModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
 		if actualModel == "" {
 			actualModel = reqModel

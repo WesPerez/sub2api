@@ -1041,6 +1041,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 	agentTaskRecoveryTried := false
 	rejectedFieldRetryState := openAIResponsesRejectedFieldRetryStateForRequest(c, body)
 	for {
+		// Preserve in-flight usage draining, but do not start another HTTP
+		// compatibility attempt after the original client has disconnected.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Build upstream request
 		upstreamCtx, releaseUpstreamCtx := detachUpstreamContext(ctx)
 		var headerGuard *openAIFirstOutputHeaderGuard
