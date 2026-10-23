@@ -66,3 +66,10 @@ network identity and the official-client canary. Runtime limits remain:
 genuine upstream quota failures can persist, and draining an in-flight request
 may outlast the client's header budget. Test results and production identities
 belong in the corresponding release evidence, not inferred from this document.
+
+The second CI run exposed two older OAuth tests that canceled before calling
+Forward while expecting a new request to start. Their detach assertion now
+cancels inside the upstream recorder after dispatch, and additionally checks
+terminal usage. The new pre-canceled tests separately require zero attempts.
+This distinguishes preserving an in-flight request from starting new work for
+a client that has already left.
