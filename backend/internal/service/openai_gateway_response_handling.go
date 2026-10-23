@@ -1869,6 +1869,9 @@ func buildOpenAIResponseFailedSSE(responseID, model string, createdAt int64, sou
 	if code == "" {
 		code = strings.TrimSpace(gjson.GetBytes(source, "response.error.code").String())
 	}
+	if code == "" && gjson.GetBytes(source, "type").String() == "error" {
+		code = strings.TrimSpace(gjson.GetBytes(source, "code").String())
+	}
 	if code == "" {
 		code = "upstream_error"
 	}
@@ -1908,6 +1911,9 @@ func buildOpenAIResponseFailedSSE(responseID, model string, createdAt int64, sou
 		payload = []byte(`{"type":"response.failed","sequence_number":` + strconv.FormatInt(sequenceNumber, 10) +
 			`,"response":{"object":"response","created_at":` + strconv.FormatInt(createdAt, 10) +
 			`,"status":"failed","output":[],"error":{"code":"upstream_error","message":"Upstream response failed"}}}`)
+	}
+	if sanitized, changed := sanitizeOpenAICapacityShedErrorCodeForClient(payload); changed {
+		payload = sanitized
 	}
 	return "event: response.failed\ndata: " + string(payload) + "\n\n"
 }

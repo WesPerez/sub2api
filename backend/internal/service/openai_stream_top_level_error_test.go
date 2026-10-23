@@ -142,7 +142,8 @@ func TestOpenAIStreamTopLevelRateLimitRespectsOutputBoundary(t *testing.T) {
 					}
 					ops, exists := c.Get(OpsUpstreamErrorsKey)
 					require.True(t, exists)
-					events := ops.([]*OpsUpstreamErrorEvent)
+					events, ok := ops.([]*OpsUpstreamErrorEvent)
+					require.True(t, ok)
 					require.NotEmpty(t, events)
 					require.Equal(t, http.StatusTooManyRequests, events[len(events)-1].UpstreamStatusCode)
 				} else {
@@ -169,4 +170,23 @@ func TestOpenAIStreamTopLevelCapacityCodeSanitization(t *testing.T) {
 	updated, changed := sanitizeOpenAICapacityShedErrorCodeForClient([]byte(topLevelRateLimitEvent))
 	require.False(t, changed)
 	require.Equal(t, topLevelRateLimitEvent, string(updated))
+}
+
+func TestOpenAITopLevelErrorSynthesizedTerminalPreservesCode(t *testing.T) {
+	for _, tc := range []struct{ name, payload, code string }{
+		{"rate limit", topLevelRateLimitEvent, "rate_limit_exceeded"},
+		{"invalid request", `{"type":"error","code":"invalid_request","message":"Invalid input"}`, "invalid_request"},
+		{"capacity", `{"type":"error","code":"server_is_overloaded","message":"Capacity unavailable"}`, "server_error"},
+		{"slow down", `{"type":"error","code":"slow_down","message":"Capacity unavailable"}`, "server_error"},
+		{"nested precedence", `{"type":"error","code":"rate_limit_exceeded","error":{"code":"invalid_request","message":"Invalid input"}}`, "invalid_request"},
+		{"unrelated top-level code", `{"type":"response.created","code":"rate_limit_exceeded"}`, "upstream_error"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame := buildOpenAIResponseFailedSSE("resp_1", "gpt-5.5", 1700000000, []byte(tc.payload), "fallback")
+			payload := strings.TrimSpace(strings.TrimPrefix(frame, "event: response.failed\ndata: "))
+			require.Equal(t, "response.failed", gjson.Get(payload, "type").String())
+			require.Equal(t, "failed", gjson.Get(payload, "response.status").String())
+			require.Equal(t, tc.code, gjson.Get(payload, "response.error.code").String())
+		})
+	}
 }

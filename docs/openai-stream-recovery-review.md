@@ -25,7 +25,9 @@ and a post-response Ops classification must be distinguished.
 ## Changes and boundaries
 
 The classifier falls back to top-level `code` only for `type: error`, retaining
-nested-code precedence and existing account retry configuration. The capacity
+nested-code precedence and existing account retry configuration. The fallback
+that synthesizes `response.failed` also preserves the top-level error code;
+the first CI run exposed this second omission after semantic output. The capacity
 error sanitizer handles the same top-level shape so its existing client code
 policy remains consistent. It does not rewrite a real rate-limit code into a
 capacity code.
